@@ -10,15 +10,14 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import sunyu.util.mqtt.QosLevel;
 
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * MQTT <b>消息生产者</b>工具类 —— 基于同步客户端 {@link MqttClient}，专用于发送消息。
  *
- * <h3>关键配置</h3>
+ * <p><b>关键配置</b>（由 Builder 传入）：
  * <ul>
- *   <li>{@code cleanSession = true}（硬编码）：发送端是"即用即走"模式，broker 不需要记住本客户端状态。</li>
- *   <li>{@code automaticReconnect = true}：底层网络断开时自动重连。</li>
+ *   <li>{@code cleanSession = true}（硬编码）：发送端是"即用即走"模式，broker 不需要记住本客户端。</li>
+ *   <li>{@code automaticReconnect = true}：底层网络断开时自动指数退避重连。</li>
  *   <li>{@code MemoryPersistence}：本地缓存未完成的 QoS 1/2 消息，重连后自动重试。</li>
  *   <li>{@code publish()} 是同步阻塞的：方法返回即代表消息已被 broker 确认（QoS 1 拿到 PUBACK，QoS 2 拿到 PUBCOMP）。</li>
  * </ul>
@@ -44,26 +43,28 @@ public class MqttPublishUtil implements AutoCloseable {
     private static final Log log = LogFactory.get();
 
     private final MqttClient client;
-    private final String broker;
     private final String clientId;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    private MqttPublishUtil(Config config) {
-        this.broker = config.broker;
-        this.clientId = config.clientId;
+    private MqttPublishUtil(String broker, String clientId, String username, char[] password,
+                            boolean cleanSession, boolean automaticReconnect, int connectionTimeoutSeconds,
+                            int keepAliveIntervalSeconds) {
+        this.clientId = clientId;
 
         try {
-            client = new MqttClient(config.broker, config.clientId, new MemoryPersistence());
+            client = new MqttClient(broker, clientId, new MemoryPersistence());
 
             MqttConnectOptions options = new MqttConnectOptions();
-            options.setCleanSession(true);
-            options.setAutomaticReconnect(config.automaticReconnect);
-            options.setConnectionTimeout(config.connectionTimeoutSeconds);
-            options.setKeepAliveInterval(config.keepAliveIntervalSeconds);
-            if (config.username != null) options.setUserName(config.username);
-            if (config.password != null) options.setPassword(config.password);
+            options.setCleanSession(cleanSession);
+            options.setAutomaticReconnect(automaticReconnect);
+            options.setConnectionTimeout(connectionTimeoutSeconds);
+            options.setKeepAliveInterval(keepAliveIntervalSeconds);
+            if (username != null) options.setUserName(username);
+            if (password != null) options.setPassword(password);
 
-            log.info("[MqttPublishUtil] 开始连接 broker={} clientId={} cleanSession=true", broker, clientId);
+            log.info("[MqttPublishUtil] 开始连接 broker={} clientId={} username={} password={} " +
+                            "cleanSession={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={}",
+                    broker, clientId, username, password != null ? "*****" : "null",
+                    cleanSession, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds);
             client.connect(options);
             log.info("[MqttPublishUtil] 连接成功 clientId={}", clientId);
         } catch (MqttException e) {
@@ -75,12 +76,6 @@ public class MqttPublishUtil implements AutoCloseable {
 
     /**
      * 同步发送一条消息。方法阻塞直到 broker 确认或超时/失败抛异常。
-     *
-     * @param topic 目标主题
-     * @param qos   QoS 等级（推荐 AT_LEAST_ONCE）
-     * @param msg   消息内容（字符串，按 UTF-8 编码）
-     * @throws IllegalArgumentException 参数非法
-     * @throws RuntimeException         发送失败（包装 {@link MqttException}）
      */
     public void publish(String topic, QosLevel qos, String msg) {
         if (topic == null || topic.isEmpty()) throw new IllegalArgumentException("topic 不能为空");
@@ -101,10 +96,6 @@ public class MqttPublishUtil implements AutoCloseable {
         }
     }
 
-    public String getBroker() {
-        return broker;
-    }
-
     public String getClientId() {
         return clientId;
     }
@@ -115,7 +106,6 @@ public class MqttPublishUtil implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) return;
         log.info("[MqttPublishUtil] 关闭 clientId={}", clientId);
         try {
             if (client.isConnected()) client.disconnect(10_000);
@@ -139,63 +129,74 @@ public class MqttPublishUtil implements AutoCloseable {
         return new Builder();
     }
 
-    private static class Config {
-        String broker = "tcp://broker.emqx.io:1883";
-        String clientId;
-        String username;
-        char[] password;
-        boolean automaticReconnect = true;
-        int connectionTimeoutSeconds = 30;
-        int keepAliveIntervalSeconds = 60;
-    }
-
+    /**
+     * Builder：链式构造 {@link MqttPublishUtil}。
+     *
+     * <p>Builder 自己持有参数（不需要额外的 Config 中间类），{@link #build()} 时把参数交给主类构造函数即可。
+     */
     public static class Builder {
-        private final Config config = new Config();
+        private String broker = "tcp://broker.emqx.io:1883";
+        private String clientId;
+        private String username;
+        private char[] password;
+        private boolean automaticReconnect = true;
+        private int connectionTimeoutSeconds = 30;
+        private int keepAliveIntervalSeconds = 60;
+        private boolean cleanSession = true; // 发布者默认 true：即用即走，broker 不需要记住本客户端
 
         public Builder setBroker(String broker) {
-            config.broker = broker;
+            this.broker = broker;
             return this;
         }
 
         public Builder setClientId(String clientId) {
-            config.clientId = clientId;
+            this.clientId = clientId;
             return this;
         }
 
         public Builder setUsername(String username) {
-            config.username = username;
+            this.username = username;
             return this;
         }
 
         public Builder setPassword(char[] password) {
-            config.password = password;
+            this.password = password;
             return this;
         }
 
         public Builder setPassword(String password) {
-            config.password = password == null ? null : password.toCharArray();
+            this.password = password == null ? null : password.toCharArray();
             return this;
         }
 
         public Builder setAutomaticReconnect(boolean automaticReconnect) {
-            config.automaticReconnect = automaticReconnect;
+            this.automaticReconnect = automaticReconnect;
             return this;
         }
 
         public Builder setConnectionTimeoutSeconds(int seconds) {
-            config.connectionTimeoutSeconds = seconds;
+            this.connectionTimeoutSeconds = seconds;
             return this;
         }
 
         public Builder setKeepAliveIntervalSeconds(int seconds) {
-            config.keepAliveIntervalSeconds = seconds;
+            this.keepAliveIntervalSeconds = seconds;
+            return this;
+        }
+
+        /**
+         * 设置 cleanSession。发布者默认 true：即用即走，broker 不需要记住本客户端。
+         */
+        public Builder setCleanSession(boolean cleanSession) {
+            this.cleanSession = cleanSession;
             return this;
         }
 
         public MqttPublishUtil build() {
-            if (config.clientId == null || config.clientId.isEmpty())
+            if (clientId == null || clientId.isEmpty())
                 throw new IllegalArgumentException("clientId 不能为空");
-            return new MqttPublishUtil(config);
+            return new MqttPublishUtil(broker, clientId, username, password,
+                    cleanSession, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds);
         }
     }
 }

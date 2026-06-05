@@ -1,6 +1,7 @@
 package sunyu.util.test;
 
 import cn.hutool.core.date.DateTime;
+import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.log.Log;
 import cn.hutool.log.LogFactory;
 import org.junit.jupiter.api.Test;
@@ -20,35 +21,25 @@ import sunyu.util.mqtt.QosLevel;
  * @author SunYu
  */
 public class TestPublish {
-
     static final Log log = LogFactory.get();
-
     static final String PUB_TOPIC = "sy/bcld/report";
-    static final int COUNT = 3;
-
-    public static void main(String[] args) {
-        try (MqttPublishUtil producer = MqttPublishUtil.builder()
-                .setBroker("tcp://broker.emqx.io:1883")
-                .setClientId("demo-producer-001")  // 发送端的 clientId，与消费端不同
-                .build()) {
-
-            for (int i = 0; i < COUNT; i++) {
-                int seq = i + 1;
-                String payload = "msg-" + DateTime.now() + "-#" + seq;
-                producer.publish(PUB_TOPIC, QosLevel.AT_LEAST_ONCE, payload);
-                log.info("[发送成功] #{}, topic={}, payload={}", seq, PUB_TOPIC, payload);
-                Thread.sleep(2000); // 稍微留点间隔，便于观察日志
-            }
-
-            log.info("全部消息已发送并确认");
-        } catch (Exception e) {
-            log.error("发送过程异常", e);
-            throw new RuntimeException(e);
-        }
-    }
+    static final int COUNT = 10;
 
     @Test
     void t001() {
-        main(null);
+        MqttPublishUtil producer = MqttPublishUtil.builder()
+                .setBroker("tcp://broker.emqx.io:1883")
+                .setClientId("demo-producer-001")  // 发送端的 clientId，与消费端不同
+                .build();
+
+        for (int i = 0; i < COUNT; i++) {
+            String payload = "msg-" + DateTime.now();
+            producer.publish(PUB_TOPIC, QosLevel.AT_LEAST_ONCE, payload);
+            log.info("[发送成功] topic={}, payload={}", PUB_TOPIC, payload);
+            ThreadUtil.sleep(1000 * 2);
+        }
+
+        log.info("全部消息已发送并确认");
+        producer.close();
     }
 }
