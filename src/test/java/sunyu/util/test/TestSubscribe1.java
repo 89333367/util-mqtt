@@ -10,7 +10,8 @@ import sunyu.util.mqtt.QosLevel;
  * 正常消费演示：订阅消息 → 业务处理 → 自动 ACK。
  *
  * <p>使用推荐的 setMessageHandler 方式：
- * 第三个参数 util 就是 consumer 自身，业务失败时可以直接调 util.republish()。
+ * 第三个参数 util 就是 consumer 自身，可以在业务失败时调用 util.requeue(topic, message) 把消息交回原主题，
+ * 或者在处理中调用 util.publish(...) 向终端下发指令。
  *
  * @author SunYu
  */
@@ -28,7 +29,8 @@ public class TestSubscribe1 {
                     log.info("[收到消息-1] messageId={}, topic={}, payload={}",
                             message.getId(), topic, new String(message.getPayload()));
                     // 业务处理：入库、转换、过滤等
-                    // 处理成功 → 自动 ACK；处理失败 catch 里 util.republish(...) 重试
+                    // 处理完毕还可以再发送消息到其他 topic
+                    util.publish("command/did", QosLevel.AT_LEAST_ONCE, "发给其他监听者");
                 })
                 .build()) {
 

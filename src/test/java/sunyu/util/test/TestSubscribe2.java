@@ -33,7 +33,7 @@ public class TestSubscribe2 {
                         log.warn("[处理失败-2] {} → 调用 republish() 将消息重新发回原主题",
                                 e.getMessage());
                         // 关键：直接用第三个参数 util 调用 republish，不需要 holder
-                        util.republish(topic, message);
+                        util.requeue(topic, message);
                     }
                 })
                 .build()) {
