@@ -13,7 +13,7 @@ import sunyu.util.mqtt.QosLevel;
  *
  * <p>典型流程：
  * <ol>
- *   <li>构造 {@link MqttPublishUtil}（cleanSession=true，会话不保留）</li>
+ *   <li>构造 {@link MqttPublishUtil}（cleanStart=true，会话不保留）</li>
  *   <li>循环调用 {@link MqttPublishUtil#publish(String, QosLevel, String)} 同步发送</li>
  *   <li>publish() 方法返回即代表消息已被 broker 确认（拿到 PUBACK/PUBCOMP）</li>
  * </ol>

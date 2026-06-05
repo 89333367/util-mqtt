@@ -2,21 +2,25 @@ package sunyu.util;
 
 import cn.hutool.log.Log;
 import cn.hutool.log.LogFactory;
-import org.eclipse.paho.client.mqttv3.*;
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.eclipse.paho.mqttv5.client.*;
+import org.eclipse.paho.mqttv5.client.persist.MemoryPersistence;
+import org.eclipse.paho.mqttv5.common.MqttException;
+import org.eclipse.paho.mqttv5.common.MqttMessage;
+import org.eclipse.paho.mqttv5.common.packet.MqttProperties;
 import sunyu.util.mqtt.QosLevel;
 
+import java.nio.charset.StandardCharsets;
 import java.util.function.Consumer;
 
 /**
- * MQTT <b>订阅消费端（Consumer）</b>工具类 —— 基于 Eclipse Paho 同步客户端 {@link MqttClient} 实现，
+ * MQTT <b>订阅消费端（Consumer）</b>工具类 —— 基于 Eclipse Paho MQTT 5 同步客户端 {@link MqttClient} 实现，
  * 专门用于从 broker 订阅主题并消费消息。
  *
  * <p>设计目标：
  * <ul>
  *   <li>与发布端隔离：使用独立的 clientId / 会话，避免"同一 clientId 既发又收"导致 broker 侧踢下线。</li>
- *   <li>默认 cleanSession=false：broker 记住本 clientId 的订阅与未处理的 QoS 1/2 消息，断线重连后继续推送。</li>
- *   <li>自动 ACK：消息经用户定义的 {@link MessageHandler} 处理后由 Paho 自动确认。</li>
+ *   <li>默认 cleanStart=false：broker 记住本 clientId 的订阅与未处理的 QoS 1/2 消息，断线重连后继续推送。</li>
+ *   <li>自动 ACK：消息经用户定义的 {@link IMqttMessageListener}（即 `messageArrived`）处理后由 Paho 自动确认。</li>
  *   <li>单一职责：订阅端只负责"接收消息并交给用户 handler 处理"；
  *       如需下发指令或把失败消息重新发回原主题，请在 handler 中使用独立的
  *       {@link MqttPublishUtil} 实例完成。</li>
@@ -28,10 +32,10 @@ import java.util.function.Consumer;
  * <ul>
  *   <li>{@code broker}：默认 {@code tcp://broker.emqx.io:1883}，broker 连接地址。</li>
  *   <li>{@code clientId}：必须显式传入固定值（如 {@code order-service-consumer-01}）；
- *       默认 cleanSession=false，broker 会按此 clientId 持久化订阅与未 ACK 消息，
+ *       默认 cleanStart=false，broker 会按此 clientId 持久化订阅与未 ACK 消息，
  *       一旦 clientId 变化，broker 无法匹配旧会话，断线重连期间的消息会丢失。</li>
  *   <li>{@code username / password}：默认 null，broker 开启鉴权时必须设置；密码在日志中脱敏为 {@code *****}。</li>
- *   <li>{@code cleanSession}：默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息。</li>
+ *   <li>{@code cleanStart}：默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息。</li>
  *   <li>{@code automaticReconnect}：默认 true —— 底层网络抖动时指数退避自动重连。</li>
  *   <li>{@code connectionTimeoutSeconds}：默认 30 秒。</li>
  *   <li>{@code keepAliveIntervalSeconds}：默认 60 秒。</li>
@@ -39,7 +43,7 @@ import java.util.function.Consumer;
  *
  * <p><b>消息处理流程</b>：
  * <ol>
- *   <li>调用方实现 {@link MessageHandler}（或 lambda），在其中做业务处理。</li>
+ *   <li>调用方实现 {@link IMqttMessageListener}（即 `messageArrived(topic, message)` 或 lambda），在其中做业务处理。</li>
  *   <li>消息到达后 Paho 自动 ACK（QoS 1/2 由协议层保证），再回调用户 handler。</li>
  *   <li>如需下发指令或把失败消息重新发回原主题，请使用独立的 {@link MqttPublishUtil} 实例，
  *       不要占用订阅端连接。</li>
@@ -89,9 +93,10 @@ public class MqttSubscribeUtil implements AutoCloseable {
     private static final Log log = LogFactory.get();
 
     /**
-     * MQTT 3.1.1 规范中 clientId 的最大字节数（23 字节）。
+     * clientId 的最大字节数（23 字节）。
      *
-     * <p>许多 broker（如 EMQX / Mosquitto / HiveMQ）仍沿用此限制；用户显式传入的 clientId 长度校验以此常量为准。
+     * <p>虽然 MQTT 5 协议已不再强制限制 clientId 长度，但许多 broker（如 EMQX / Mosquitto / HiveMQ）
+     * 仍沿用此限制；用户显式传入的 clientId 长度校验以此常量为准。
      */
     private static final int MAX_CLIENT_ID_LENGTH = 23;
 
@@ -107,57 +112,29 @@ public class MqttSubscribeUtil implements AutoCloseable {
     private final String clientId;
 
     /**
-     * 消息处理回调函数式接口。订阅端只负责"接收消息并交给用户 handler 处理"，
-     * 不对外提供发布消息能力；如需下发指令或把失败消息重新发回原主题，
-     * 请在外部构建一个独立的 {@link MqttPublishUtil} 实例。
-     *
-     * <p>用法：
-     * <pre>
-     * builder.setMessageHandler((topic, message) -> {
-     *     // 业务处理：入库、解析、验证等
-     *     // 如需下发指令或发布失败消息，使用外部 MqttPublishUtil
-     * });
-     * </pre>
-     *
-     * <p>参数说明：
-     * <ul>
-     *   <li>{@code topic}：消息到达时的实际主题名（原样）。</li>
-     *   <li>{@code message}：原始 MQTT 消息对象，包含 payload、qos、retained、duplicate、messageId 等元信息。</li>
-     * </ul>
-     */
-    @FunctionalInterface
-    public interface MessageHandler {
-        /**
-         * 消息到达后由 Paho 在其回调线程中调用此方法。
-         *
-         * <p>Paho 已在协议层按 QoS 等级自动完成 ACK（QoS 1 自动回 PUBACK，QoS 2 自动完成
-         * PUBREC → PUBREL → PUBCOMP 流程），因此到达这里时消息对 broker 而言"已消费"。
-         * 如需"失败后交给同组其他实例重试"，可在 catch 中用独立的 {@link MqttPublishUtil}
-         * 把原消息重新发布到原主题（配合共享订阅 `$share/group/topic` 使用）。
-         *
-         * <p>注意：本方法由 Paho 内部线程回调，若业务逻辑较重（例如耗时的 DB 操作），
-         * 建议将耗时处理提交到自定义线程池，避免阻塞同一 client 的其他消息处理。
-         *
-         * @param topic   实际主题名
-         * @param message 原始 MQTT 消息（含 payload 与 qos 等）
-         * @throws Exception 业务异常；抛出后消息不会自动重复消费（Paho 已自动 ACK），
-         *                   如需"失败交给其他实例重试"，请在 catch 中用独立发布端重新发回原主题。
-         */
-        void handle(String topic, MqttMessage message) throws Exception;
-    }
-
-    /**
      * 私有构造方法 —— 仅由 {@link Builder#build()} 调用。
      *
      * <p>执行顺序：
      * <ol>
      *   <li>创建底层 {@link MqttClient}，指定 broker、clientId 与 {@link MemoryPersistence}。</li>
-     *   <li>组装 {@link MqttCallback}：将用户传入的 messageHandler / connectionLostHandler /
-     *       deliveryCompleteHandler 包装为统一回调；未传的使用默认行为（日志 / 空实现）。</li>
-     *   <li>组装 {@link MqttConnectOptions}，注入 cleanSession、自动重连、超时、心跳、鉴权等参数。</li>
+     *   <li>组装 {@link MqttCallback}：将用户传入的 messageHandler / disconnectedHandler /
+     *       mqttErrorOccurredHandler / deliveryCompleteHandler 包装为统一回调；
+     *       未传的使用默认行为（日志 / 空实现）。
+     *       消息到达时直接调用用户注册的 {@link IMqttMessageListener#messageArrived(String, MqttMessage)}。</li>
+     *   <li>组装 {@link MqttConnectionOptions}，注入 cleanStart、自动重连、超时、心跳、鉴权等参数。</li>
      *   <li>打印包含全部初始化参数的 INFO 日志（password 以 {@code *****} 脱敏）。</li>
      *   <li>调用 connect() 阻塞直到收到 CONNACK 或超时抛异常；失败时封装为 {@link RuntimeException}。</li>
      * </ol>
+     *
+     * <p>消息处理回调说明：
+     * <ul>
+     *   <li>Paho 已在协议层按 QoS 等级自动完成 ACK（QoS 1 自动回 PUBACK，QoS 2 自动完成
+     *       PUBREC → PUBREL → PUBCOMP 流程），因此到达 `messageArrived` 时消息对 broker 而言"已消费"。</li>
+     *   <li>如需"失败后交给同组其他实例重试"，请在外部使用独立的 {@link MqttPublishUtil} 把原消息
+     *       重新发布到原主题（配合共享订阅 `$share/group/topic` 使用）。</li>
+     *   <li>`messageArrived` 由 Paho 内部线程回调，若业务逻辑较重（例如耗时的 DB 操作），
+     *       建议将耗时处理提交到自定义线程池，避免阻塞同一 client 的其他消息处理。</li>
+     * </ul>
      *
      * @param b 包含全部构建参数的 {@link Builder} 实例
      */
@@ -169,23 +146,36 @@ public class MqttSubscribeUtil implements AutoCloseable {
             client = new MqttClient(b.broker, clientId, new MemoryPersistence());
 
             // 组装 MqttCallback：以 messageHandler 为消息处理核心；
-            // connectionLost / deliveryComplete 可通过 Builder 单独覆盖
-            final MessageHandler handler = b.messageHandler;
-            final Consumer<Throwable> connLost = b.connectionLostHandler;
-            final Consumer<IMqttDeliveryToken> delivDone = b.deliveryCompleteHandler;
+            // disconnected / deliveryComplete / mqttErrorOccurred 可通过 Builder 单独覆盖
+            final IMqttMessageListener handler = b.messageHandler;
+            final Consumer<MqttDisconnectResponse> connLost = b.disconnectedHandler;
+            final Consumer<IMqttToken> delivDone = b.deliveryCompleteHandler;
+            final Consumer<MqttException> errHandler = b.mqttErrorHandler;
 
             client.setCallback(new MqttCallback() {
                 /**
-                 * 连接断开回调。用户传入 connectionLostHandler 则调用用户逻辑；否则打印 WARN 日志，
-                 * 由 automaticReconnect=true 的底层机制自动指数退避重连。
+                 * 正常断开回调。由底层在正常 DISCONNECT 交互完成后触发。
                  */
                 @Override
-                public void connectionLost(Throwable cause) {
+                public void disconnected(MqttDisconnectResponse disconnectResponse) {
                     if (connLost != null) {
-                        connLost.accept(cause);
+                        connLost.accept(disconnectResponse);
                     } else {
-                        log.warn("[MqttSubscribeUtil] 连接断开 clientId={} {}", clientId,
-                                cause != null ? cause.getMessage() : "null");
+                        log.warn("[MqttSubscribeUtil] 连接断开 clientId={} reasonString={}",
+                                clientId, disconnectResponse != null ? disconnectResponse.getReasonString() : "null");
+                    }
+                }
+
+                /**
+                 * MQTT 协议层错误回调。当发生协议级错误（如异常报文）时触发；未设置时记录 WARN 日志。
+                 */
+                @Override
+                public void mqttErrorOccurred(MqttException exception) {
+                    if (errHandler != null) {
+                        errHandler.accept(exception);
+                    } else {
+                        log.warn("[MqttSubscribeUtil] MQTT 协议层错误 clientId={} {}",
+                                clientId, exception != null ? exception.getMessage() : "null");
                     }
                 }
 
@@ -194,11 +184,21 @@ public class MqttSubscribeUtil implements AutoCloseable {
                  * 保留用于扩展或与其他组件集成。用户未传入 deliveryCompleteHandler 时空实现。
                  */
                 @Override
-                public void deliveryComplete(IMqttDeliveryToken token) {
+                public void deliveryComplete(IMqttToken token) {
                     if (delivDone != null) {
                         delivDone.accept(token);
                     }
                     // 未传则空实现：订阅端默认不关心发送完成
+                }
+
+                /**
+                 * 连接完成回调。automaticReconnect=true 时，断线重连也会触发该方法；
+                 * 参数 reconnect 为 true 代表是重连后回调，false 代表首次 connect 回调。
+                 */
+                @Override
+                public void connectComplete(boolean reconnect, String serverURI) {
+                    log.info("[MqttSubscribeUtil] {} 完成 clientId={} serverURI={}",
+                            reconnect ? "重连" : "连接", clientId, serverURI);
                 }
 
                 /**
@@ -217,23 +217,32 @@ public class MqttSubscribeUtil implements AutoCloseable {
                  */
                 @Override
                 public void messageArrived(String topic, MqttMessage message) throws Exception {
-                    handler.handle(topic, message);
+                    handler.messageArrived(topic, message);
+                }
+
+                /**
+                 * 认证令牌回调。默认不启用 Enhanced Authentication，空实现即可。
+                 */
+                @Override
+                public void authPacketArrived(int reasonCode, MqttProperties properties) {
+                    // 默认空实现：未启用 Enhanced Authentication 时不会触发
                 }
             });
 
-            // 组装 MqttConnectOptions
-            MqttConnectOptions options = new MqttConnectOptions();
-            options.setCleanSession(b.cleanSession);
+            // 组装 MqttConnectionOptions（MQTT 5 版本）
+            MqttConnectionOptions options = new MqttConnectionOptions();
+            options.setCleanStart(b.cleanStart);
             options.setAutomaticReconnect(b.automaticReconnect);
             options.setConnectionTimeout(b.connectionTimeoutSeconds);
             options.setKeepAliveInterval(b.keepAliveIntervalSeconds);
             if (b.username != null) options.setUserName(b.username);
-            if (b.password != null) options.setPassword(b.password);
+            if (b.password != null)
+                options.setPassword(new String(b.password).getBytes(StandardCharsets.UTF_8));
 
             log.info("[MqttSubscribeUtil] 开始连接 broker={} clientId={} username={} password={} " +
-                            "cleanSession={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={}",
+                            "cleanStart={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={}",
                     b.broker, clientId, b.username, b.password != null ? "*****" : "null",
-                    b.cleanSession, b.automaticReconnect, b.connectionTimeoutSeconds, b.keepAliveIntervalSeconds);
+                    b.cleanStart, b.automaticReconnect, b.connectionTimeoutSeconds, b.keepAliveIntervalSeconds);
 
             // 阻塞直到收到 CONNACK 或超时；失败抛 MqttException
             client.connect(options);
@@ -249,7 +258,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
      * 同步订阅一个主题（或主题过滤器）。方法阻塞直到 broker 返回 SUBACK，或超时/失败抛异常。
      *
      * <p>可重复调用本方法订阅多个主题过滤器；每个主题过滤器的消息都会走同一个
-     * {@link MessageHandler}（可在 handler 内按主题名做分发）。
+     * {@link IMqttMessageListener}（可在 `messageArrived` 内按主题名做分发）。
      *
      * <p>主题过滤器支持：
      * <ul>
@@ -280,27 +289,6 @@ public class MqttSubscribeUtil implements AutoCloseable {
     }
 
     /**
-     * 返回本实例实际使用的 clientId（来自用户显式设置）。
-     *
-     * @return clientId
-     */
-    public String getClientId() {
-        return clientId;
-    }
-
-    /**
-     * 底层客户端是否处于已连接状态。
-     *
-     * <p><b>注意</b>：该值基于 Paho 的内部状态，网络断开瞬间可能仍短暂返回 true；
-     * 可靠判定应结合 {@link Builder#setConnectionLostHandler(Consumer)} 回调、订阅异常等综合判断。
-     *
-     * @return true 表示当前 Paho 认为已连接
-     */
-    public boolean isConnected() {
-        return client.isConnected();
-    }
-
-    /**
      * 优雅关闭订阅端客户端。
      *
      * <p>关闭策略：
@@ -315,15 +303,13 @@ public class MqttSubscribeUtil implements AutoCloseable {
     public void close() {
         log.info("[MqttSubscribeUtil] 关闭 clientId={}", clientId);
         try {
-            // 温和断开：给未完成的消息最多 10 秒处理完
-            if (client.isConnected()) {
-                client.disconnect(10_000);
-            }
+            // 温和断开：给未完成的 QoS 1/2 消息最多 10 秒完成握手
+            if (client.isConnected()) client.disconnect(10_000L);
         } catch (MqttException e) {
             log.warn("[MqttSubscribeUtil] disconnect 异常 {}", e.getMessage());
             try {
                 // 强制断开兜底：5 秒内未完成则直接关闭 socket，最长等待 10 秒
-                client.disconnectForcibly(5000, 10_000);
+                client.disconnectForcibly(5000L, 10_000L);
             } catch (MqttException ex) {
                 log.warn("[MqttSubscribeUtil] 强制断开也失败 {}", ex.getMessage());
             }
@@ -349,7 +335,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
     /**
      * Builder：通过链式调用构造 {@link MqttSubscribeUtil} 实例。
      *
-     * <p>必需项：{@link #setMessageHandler(MessageHandler)}。其余参数均有合理默认值，可按需覆盖。
+     * <p>必需项：{@link Builder#setMessageHandler(IMqttMessageListener)}。其余参数均有合理默认值，可按需覆盖。
      *
      * <p>典型用法：
      * <pre>
@@ -376,7 +362,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
 
         /**
          * 客户端标识。必须显式传入固定值（例如 {@code order-service-consumer-01}），
-         * 并在多次启动时保持一致，否则 cleanSession=false 场景下断线重连期间的消息会丢失。
+         * 并在多次启动时保持一致，否则 cleanStart=false 场景下断线重连期间的消息会丢失。
          */
         String clientId;
 
@@ -406,28 +392,34 @@ public class MqttSubscribeUtil implements AutoCloseable {
         int keepAliveIntervalSeconds = 60;
 
         /**
-         * cleanSession 标记。订阅者默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息，
+         * cleanStart 标记。订阅者默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息，
          * 重连后继续推送。若改为 true，每次连接都是全新会话，断线期间的消息可能丢失（除非 QoS 1/2 且
          * 有保留消息机制弥补）。
          */
-        boolean cleanSession = false;
+        boolean cleanStart = false;
 
         /**
          * 消息处理器。build 前必须设置（非 null）。
+         * 直接使用 Paho 的 {@link IMqttMessageListener}，即 `messageArrived(String topic, MqttMessage message)`。
          */
-        MessageHandler messageHandler;
+        IMqttMessageListener messageHandler;
 
         /**
          * 连接断开回调。可选；未设置时使用默认行为（打印 WARN 日志 + 底层自动重连）。
          */
-        Consumer<Throwable> connectionLostHandler;
+        Consumer<MqttDisconnectResponse> disconnectedHandler;
 
         /**
          * 发送完成回调。可选；订阅端不主动发消息，该回调在本工具类中通常不会触发。
          * 如果外部还有独立的 MqttPublishUtil 实例需要跟踪发送完成，
          * 可在外部单独注册其回调。
          */
-        Consumer<IMqttDeliveryToken> deliveryCompleteHandler;
+        Consumer<IMqttToken> deliveryCompleteHandler;
+
+        /**
+         * MQTT 协议层错误回调。可选；未设置时使用默认行为（打印 WARN 日志）。
+         */
+        Consumer<MqttException> mqttErrorHandler;
 
         /**
          * 设置 broker 连接地址。
@@ -441,7 +433,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         /**
-         * 设置 clientId。订阅端默认 cleanSession=false，必须显式传入固定值，
+         * 设置 clientId。订阅端默认 cleanStart=false，必须显式传入固定值，
          * 并在多次启动时保持一致，否则 broker 无法匹配旧会话，断线重连期间的消息会丢失。
          *
          * @param clientId 客户端标识（不能为空，且长度 ≤ 23 字节；超出或为空会在 build 时抛异常）
@@ -524,17 +516,17 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         /**
-         * 设置 cleanSession 标记。订阅者默认 false。
+         * 设置 cleanStart 标记。订阅者默认 false。
          *
          * <p>false：broker 记住本 clientId 的订阅与未 ACK 消息，重连后继续推送 —— 适合消息不能丢的消费端。
          * <br>
          * true：每次连接都是全新会话，broker 不缓存状态 —— 断线期间消息可能丢失（除非 QoS 1/2 且有保留消息机制弥补）。
          *
-         * @param cleanSession true 表示每次连接开启全新会话
+         * @param cleanStart true 表示每次连接开启全新会话
          * @return this 链式调用
          */
-        public Builder setCleanSession(boolean cleanSession) {
-            this.cleanSession = cleanSession;
+        public Builder setCleanStart(boolean cleanStart) {
+            this.cleanStart = cleanStart;
             return this;
         }
 
@@ -559,14 +551,15 @@ public class MqttSubscribeUtil implements AutoCloseable {
          * });
          * </pre>
          *
-         * <p>如果还需要自定义连接断开 / 发送完成事件，可配合
-         * {@link #setConnectionLostHandler(Consumer)} /
+         * <p>如果还需要自定义连接断开 / 协议层错误 / 发送完成事件，可配合
+         * {@link #setDisconnectedHandler(Consumer)} /
+         * {@link #setMqttErrorHandler(Consumer)} /
          * {@link #setDeliveryCompleteHandler(Consumer)} 使用。
          *
          * @param handler 消息处理器；null 将在 {@link #build()} 时抛异常
          * @return this 链式调用
          */
-        public Builder setMessageHandler(MessageHandler handler) {
+        public Builder setMessageHandler(IMqttMessageListener handler) {
             this.messageHandler = handler;
             return this;
         }
@@ -574,11 +567,22 @@ public class MqttSubscribeUtil implements AutoCloseable {
         /**
          * 自定义连接断开回调。不传则使用默认行为（打印 WARN 日志，由 automaticReconnect 底层自动重连）。
          *
-         * @param handler 收到连接断开原因（Throwable）；可在其中发告警、记录指标等
+         * @param handler 收到连接断开响应（可从中获取 reasonString / returnCode / properties 等信息）
          * @return this 链式调用
          */
-        public Builder setConnectionLostHandler(Consumer<Throwable> handler) {
-            this.connectionLostHandler = handler;
+        public Builder setDisconnectedHandler(Consumer<MqttDisconnectResponse> handler) {
+            this.disconnectedHandler = handler;
+            return this;
+        }
+
+        /**
+         * 自定义 MQTT 协议层错误回调。不传则使用默认行为（打印 WARN 日志）。
+         *
+         * @param handler 收到协议层异常（含 reasonCode / message 等信息）
+         * @return this 链式调用
+         */
+        public Builder setMqttErrorHandler(Consumer<MqttException> handler) {
+            this.mqttErrorHandler = handler;
             return this;
         }
 
@@ -589,7 +593,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
          * @param handler 收到发送完成的 token（可从中获取 messageId、topic 等信息）
          * @return this 链式调用
          */
-        public Builder setDeliveryCompleteHandler(Consumer<IMqttDeliveryToken> handler) {
+        public Builder setDeliveryCompleteHandler(Consumer<IMqttToken> handler) {
             this.deliveryCompleteHandler = handler;
             return this;
         }
@@ -600,7 +604,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
          * <p>执行逻辑：
          * <ol>
          *   <li>若 clientId 未设置或为空 → 抛 {@link IllegalArgumentException}（订阅端默认
-         *       cleanSession=false，必须使用固定 clientId，否则断线重连时 broker 无法匹配旧会话，
+         *       cleanStart=false，必须使用固定 clientId，否则断线重连时 broker 无法匹配旧会话，
          *       缓存的订阅关系与未推送的消息都会丢失）。</li>
          *   <li>若用户传入的 clientId 超出 23 字节 → 抛 {@link IllegalArgumentException}。</li>
          *   <li>若 messageHandler 未设置 → 抛 {@link IllegalArgumentException}（必须有处理器）。</li>
@@ -614,7 +618,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
          */
         public MqttSubscribeUtil build() {
             if (clientId == null || clientId.isEmpty()) {
-                throw new IllegalArgumentException("clientId 不能为空：订阅端默认 cleanSession=false，" +
+                throw new IllegalArgumentException("clientId 不能为空：订阅端默认 cleanStart=false，" +
                         "必须显式传入固定 clientId（例如 \"order-service-consumer-01\"），" +
                         "否则断线重连时 broker 无法匹配旧会话，缓存的订阅关系与未推送消息都会丢失。");
             }

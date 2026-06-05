@@ -38,10 +38,10 @@
             <version>5.8.46</version>
             <optional>true</optional>
         </dependency>
-        <!-- https://central.sonatype.com/artifact/org.eclipse.paho/org.eclipse.paho.client.mqttv3/versions -->
+        <!-- https://central.sonatype.com/artifact/org.eclipse.paho/org.eclipse.paho.mqttv5.client/versions -->
         <dependency>
             <groupId>org.eclipse.paho</groupId>
-            <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
+            <artifactId>org.eclipse.paho.mqttv5.client</artifactId>
             <version>1.2.5</version>
             <optional>true</optional>
         </dependency>

@@ -4,12 +4,12 @@
 
 ## 特性
 
-- `MqttPublishUtil`：消息发布者，默认 `cleanSession=true`
-- `MqttSubscribeUtil`：消息订阅者，默认 `cleanSession=false`，断线后 broker 继续缓存本 clientId 的消息
+- `MqttPublishUtil`：消息发布者，默认 `cleanStart=true`
+- `MqttSubscribeUtil`：消息订阅者，默认 `cleanStart=false`，断线后 broker 继续缓存本 clientId 的消息
 - 类型安全的 QoS：使用 `QosLevel` 枚举，避免误传非法值
-- 自动 ACK：消息到达后由 Paho 在协议层自动确认
+- 自动 ACK：消息到达后由 Paho 在 MQTT 5 协议层自动确认
 - **订阅端只负责"收消息"**：如需下发指令或"失败时把消息重新发回原主题"，请使用独立的 `MqttPublishUtil` 实例（两个独立 clientId，避免共用连接造成问题）
-- **订阅端必须显式传入 clientId**（默认 cleanSession=false，broker 会按此 clientId 缓存会话，clientId 变化会导致断线期间的消息丢失）；**发布端未设置时自动生成**前缀 `pub-` 的 UUID，并校验用户传入值长度（≤23 字节）
+- **订阅端必须显式传入 clientId**（默认 `cleanStart=false`，broker 会按此 clientId 存储会话，clientId 变化会导致断线期间的消息丢失）；**发布端未设置时自动生成**前缀 `pub-` 的 UUID，并校验用户传入值长度（≤23 字节）
 - 实现 `AutoCloseable`，推荐使用 try-with-resources 自动释放底层 socket 与线程
 - 初始化日志打印全部参数，密码脱敏为 `*****`
 
@@ -387,7 +387,7 @@ MqttPublishUtil.builder()
     .setClientId("my-client")                // 客户端标识；未设置时自动生成 pub-xxx
     .setUsername("user")                     // 鉴权用户名（可选）
     .setPassword("pwd")                      // 鉴权密码（可选，支持 String / char[]）
-    .setCleanSession(true)                   // 发布端默认 true，订阅端默认 false
+    .setCleanStart(true)                     // 发布端默认 true，订阅端默认 false（MQTT 5 Clean Start）
     .setAutomaticReconnect(true)             // 默认 true，网络抖动自动指数退避重连
     .setConnectionTimeoutSeconds(30)         // connect 同步超时，默认 30
     .setKeepAliveIntervalSeconds(60)         // 心跳，默认 60，建议小于 broker 的会话超期时间
@@ -395,12 +395,13 @@ MqttPublishUtil.builder()
 
 // MqttSubscribeUtil 额外支持
 MqttSubscribeUtil.builder()
-    .setClientId("my-consumer")              // 客户端标识；必须显式传入（默认 cleanSession=false，不能自动生成）
+    .setClientId("my-consumer")              // 客户端标识；必须显式传入（默认 cleanStart=false，不能自动生成）
     .setMessageHandler((topic, message) -> {
         // 正常业务：解析 payload、入库、转发 ...
         // 如需下发指令或把失败消息重新发布，请使用独立的 MqttPublishUtil
     })                                                        // 必需
-    .setConnectionLostHandler(cause -> { ... })               // 可选，连接断开回调
+    .setDisconnectedHandler(resp -> { ... })                 // 可选，连接断开回调（MqttDisconnectResponse）
+    .setMqttErrorHandler(ex -> { ... })                      // 可选，MQTT 协议层错误回调（MqttException）
     .setDeliveryCompleteHandler(token -> { ... })             // 可选，订阅端默认不主动发消息，保留用于扩展
     .build();
 ```

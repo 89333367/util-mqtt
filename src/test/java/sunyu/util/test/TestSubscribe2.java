@@ -50,7 +50,8 @@ public class TestSubscribe2 {
                     }
                 })
                 // 可选：监听连接断开事件
-                .setConnectionLostHandler(cause -> log.warn("[连接断开] {}", cause.getMessage()))
+                .setDisconnectedHandler(response -> log.warn("[连接断开] {}",
+                        response != null ? response.getReasonString() : "null"))
                 .build()) {
 
             consumer.subscribe(SUB_TOPIC, QosLevel.AT_LEAST_ONCE);

@@ -7,7 +7,7 @@ package sunyu.util.mqtt;
  * {@code MqttSubscribeUtil#subscribe(...)} 等方法时，以类型安全的方式指定 QoS，
  * 避免调用方直接传入裸 int 值从而产生非法值（如 -1、3 等）。
  *
- * <p><b>三个等级语义说明（基于 MQTT 3.1.1 规范）</b>：
+ * <p><b>三个等级语义说明</b>：
  * <ul>
  *   <li><b>{@link #AT_MOST_ONCE}（int=0）</b>：最多一次。消息只发送一次、发送后即丢弃，不做任何确认。消息可能丢失，
  *       但绝不会重复。适用于高频遥测数据、实时行情、不敏感状态更新等可容忍少量丢失的场景。</li>
@@ -32,7 +32,7 @@ package sunyu.util.mqtt;
  * <p><b>与工具类结合的最佳实践</b>：
  * <ul>
  *   <li>发布端：对"不能丢"的消息使用 {@link #AT_LEAST_ONCE}；对高敏感业务使用 {@link #EXACTLY_ONCE}。</li>
- *   <li>订阅端：默认 cleanSession=false 的订阅端只负责"收消息"，不负责发布；业务处理失败时请另外创建
+ *   <li>订阅端：默认 cleanStart=false 的订阅端只负责"收消息"，不负责发布；业务处理失败时请另外创建
  *       独立的 {@code MqttPublishUtil} 把原消息重新发布到原主题，配合共享订阅
  *       （{@code $share/group/topic}）实现"失败交给同组其他实例重试"。</li>
  * </ul>
