@@ -32,9 +32,9 @@ package sunyu.util.mqtt;
  * <p><b>与工具类结合的最佳实践</b>：
  * <ul>
  *   <li>发布端：对"不能丢"的消息使用 {@link #AT_LEAST_ONCE}；对高敏感业务使用 {@link #EXACTLY_ONCE}。</li>
- *   <li>订阅端：同主题建议发布端 QoS，且在业务处理失败时可调用
- *       {@code MqttSubscribeUtil#republish(String, org.eclipse.paho.client.mqttv3.MqttMessage)}
- *       把消息重新发布回原主题，配合共享订阅（{@code $share/group/topic}）实现"失败交给同组其他实例重试"。</li>
+ *   <li>订阅端：默认 cleanSession=false 的订阅端只负责"收消息"，不负责发布；业务处理失败时请另外创建
+ *       独立的 {@code MqttPublishUtil} 把原消息重新发布到原主题，配合共享订阅
+ *       （{@code $share/group/topic}）实现"失败交给同组其他实例重试"。</li>
  * </ul>
  *
  * @author SunYu

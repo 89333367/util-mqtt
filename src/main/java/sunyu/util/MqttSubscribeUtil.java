@@ -6,8 +6,6 @@ import org.eclipse.paho.client.mqttv3.*;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import sunyu.util.mqtt.QosLevel;
 
-import java.nio.charset.StandardCharsets;
-import java.util.UUID;
 import java.util.function.Consumer;
 
 /**
@@ -18,9 +16,10 @@ import java.util.function.Consumer;
  * <ul>
  *   <li>与发布端隔离：使用独立的 clientId / 会话，避免"同一 clientId 既发又收"导致 broker 侧踢下线。</li>
  *   <li>默认 cleanSession=false：broker 记住本 clientId 的订阅与未处理的 QoS 1/2 消息，断线重连后继续推送。</li>
- *   <li>自动 ACK：消息经用户定义的 {@link MessageHandler} 处理后由 Paho 自动确认；业务失败时可调用
- *       {@link #requeue(String, MqttMessage)} 把消息重新发回原主题，配合共享订阅
- *       （{@code $share/group/topic}）实现"失败交给同组其他实例重试"。</li>
+ *   <li>自动 ACK：消息经用户定义的 {@link MessageHandler} 处理后由 Paho 自动确认。</li>
+ *   <li>单一职责：订阅端只负责"接收消息并交给用户 handler 处理"；
+ *       如需下发指令或把失败消息重新发回原主题，请在 handler 中使用独立的
+ *       {@link MqttPublishUtil} 实例完成。</li>
  *   <li>类型安全的 QoS：通过 {@link QosLevel} 枚举传入订阅等级。</li>
  *   <li>资源安全：实现 {@link AutoCloseable}，配合 try-with-resources 自动释放。</li>
  * </ul>
@@ -28,8 +27,9 @@ import java.util.function.Consumer;
  * <p><b>核心配置项（通过 Builder 链式设置）</b>：
  * <ul>
  *   <li>{@code broker}：默认 {@code tcp://broker.emqx.io:1883}，broker 连接地址。</li>
- *   <li>{@code clientId}：未设置时自动生成 {@code sub-<UUID 截断>}；若 cleanSession=false，
- *       建议显式设置"服务名 + 实例编号"形式的固定值，以便 broker 持久化会话。</li>
+ *   <li>{@code clientId}：必须显式传入固定值（如 {@code order-service-consumer-01}）；
+ *       默认 cleanSession=false，broker 会按此 clientId 持久化订阅与未 ACK 消息，
+ *       一旦 clientId 变化，broker 无法匹配旧会话，断线重连期间的消息会丢失。</li>
  *   <li>{@code username / password}：默认 null，broker 开启鉴权时必须设置；密码在日志中脱敏为 {@code *****}。</li>
  *   <li>{@code cleanSession}：默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息。</li>
  *   <li>{@code automaticReconnect}：默认 true —— 底层网络抖动时指数退避自动重连。</li>
@@ -41,32 +41,37 @@ import java.util.function.Consumer;
  * <ol>
  *   <li>调用方实现 {@link MessageHandler}（或 lambda），在其中做业务处理。</li>
  *   <li>消息到达后 Paho 自动 ACK（QoS 1/2 由协议层保证），再回调用户 handler。</li>
- *   <li>业务处理中如需下发指令给终端，可调用第三个参数 {@code util.publish("command/xxx", QosLevel.AT_LEAST_ONCE, "cmd")}，
- *       在消息处理过程中以同一 client 发送消息。</li>
- *   <li>若业务处理失败，可调用第三个参数 {@code util.requeue(topic, message)}，把消息重新发回原主题，
- *       让 broker 按共享订阅规则重新负载均衡给同组其他订阅者（实现"失败交给别人重试"）。</li>
+ *   <li>如需下发指令或把失败消息重新发回原主题，请使用独立的 {@link MqttPublishUtil} 实例，
+ *       不要占用订阅端连接。</li>
  * </ol>
  *
  * <p><b>快速上手</b>：
  * <pre>
- * try (MqttSubscribeUtil consumer = MqttSubscribeUtil.builder()
+ * // 1) 先构建一个独立的发布端（下发指令用）
+ * try (MqttPublishUtil publisher = MqttPublishUtil.builder()
  *         .setBroker("tcp://your-broker:1883")
- *         .setClientId("order-service-consumer-01")
- *         .setMessageHandler((topic, message, util) -> {
- *             try {
- *                 // 业务逻辑：入库、解析、验证等
- *                 String payload = new String(message.getPayload());
- *                 log.info("消费成功 topic={} payload={}", topic, payload);
- *                 // 处理中若需要向终端下发指令，可直接调用 util.publish(...)
- *                 util.publish("command/did-" + message.getId(), QosLevel.AT_LEAST_ONCE, "do_something");
- *             } catch (Exception e) {
- *                 // 业务失败：把消息重新发回原主题，由同组其他订阅者继续处理
- *                 util.requeue(topic, message);
- *             }
- *         })
- *         .build()) {
+ *         .setClientId("order-service-publisher-01")
+ *         .build();
  *
- *     // 共享订阅示例：$share/group1/order/created 表示加入 group1 组，同组仅一个成员收到消息
+ *      // 2) 再构建订阅端，在 handler 中复用上面的 publisher
+ *      MqttSubscribeUtil consumer = MqttSubscribeUtil.builder()
+ *              .setBroker("tcp://your-broker:1883")
+ *              .setClientId("order-service-consumer-01")
+ *              .setMessageHandler((topic, message) -> {
+ *                  try {
+ *                      String payload = new String(message.getPayload());
+ *                      // 业务处理：入库、解析、验证等
+ *                      // 处理中如需下发指令给终端，使用独立的 MqttPublishUtil
+ *                      publisher.publish("command/did-" + message.getId(),
+ *                                        QosLevel.AT_LEAST_ONCE, "do_something");
+ *                  } catch (Exception e) {
+ *                      // 业务失败：需要把消息重新发回原主题交给其他实例重试，
+ *                      // 同样使用独立的 MqttPublishUtil，不要在订阅端连接上发消息
+ *                      publisher.publish(topic, QosLevel.AT_LEAST_ONCE, message.getPayload());
+ *                  }
+ *              })
+ *              .build()) {
+ *
  *     consumer.subscribe("$share/group1/order/created", QosLevel.AT_LEAST_ONCE);
  *     consumer.subscribe("order/paid",                 QosLevel.AT_LEAST_ONCE);
  *
@@ -86,7 +91,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
     /**
      * MQTT 3.1.1 规范中 clientId 的最大字节数（23 字节）。
      *
-     * <p>许多 broker（如 EMQX / Mosquitto / HiveMQ）仍沿用此限制；自动生成逻辑与用户传入值校验均以此常量为准。
+     * <p>许多 broker（如 EMQX / Mosquitto / HiveMQ）仍沿用此限制；用户显式传入的 clientId 长度校验以此常量为准。
      */
     private static final int MAX_CLIENT_ID_LENGTH = 23;
 
@@ -97,19 +102,20 @@ public class MqttSubscribeUtil implements AutoCloseable {
     private final MqttClient client;
 
     /**
-     * 本实例实际使用的 clientId。来自用户显式设置或 {@link Builder#build()} 阶段的自动生成。
+     * 本实例实际使用的 clientId。必须由用户通过 Builder 显式传入，且在多次重启时保持一致。
      */
     private final String clientId;
 
     /**
-     * 消息处理回调函数式接口。
+     * 消息处理回调函数式接口。订阅端只负责"接收消息并交给用户 handler 处理"，
+     * 不对外提供发布消息能力；如需下发指令或把失败消息重新发回原主题，
+     * 请在外部构建一个独立的 {@link MqttPublishUtil} 实例。
      *
      * <p>用法：
      * <pre>
-     * builder.setMessageHandler((topic, message, util) -> {
+     * builder.setMessageHandler((topic, message) -> {
      *     // 业务处理：入库、解析、验证等
-     *     // 处理中如需下发指令给终端，可直接调用 util.publish("command/xxx", QosLevel.AT_LEAST_ONCE, "cmd")
-     *     // 失败时 util.requeue(topic, message); // 把消息重新发回原主题，交给同组其他订阅者继续处理
+     *     // 如需下发指令或发布失败消息，使用外部 MqttPublishUtil
      * });
      * </pre>
      *
@@ -117,8 +123,6 @@ public class MqttSubscribeUtil implements AutoCloseable {
      * <ul>
      *   <li>{@code topic}：消息到达时的实际主题名（原样）。</li>
      *   <li>{@code message}：原始 MQTT 消息对象，包含 payload、qos、retained、duplicate、messageId 等元信息。</li>
-     *   <li>{@code util}：本订阅工具类实例自身；处理中可调用 {@link #publish(String, QosLevel, String)} 向终端下发指令；
-     *       业务失败时可调用 {@link #requeue(String, MqttMessage)} 把消息重新发回原主题，交由同组其他订阅者重试。</li>
      * </ul>
      */
     @FunctionalInterface
@@ -127,19 +131,19 @@ public class MqttSubscribeUtil implements AutoCloseable {
          * 消息到达后由 Paho 在其回调线程中调用此方法。
          *
          * <p>Paho 已在协议层按 QoS 等级自动完成 ACK（QoS 1 自动回 PUBACK，QoS 2 自动完成
-         * PUBREC → PUBREL → PUBCOMP 流程），因此到达这里时消息对 broker 而言"已消费"。若业务处理失败需重试，
-         * 应在 catch 中显式调用 {@code util.requeue(topic, message)}。
+         * PUBREC → PUBREL → PUBCOMP 流程），因此到达这里时消息对 broker 而言"已消费"。
+         * 如需"失败后交给同组其他实例重试"，可在 catch 中用独立的 {@link MqttPublishUtil}
+         * 把原消息重新发布到原主题（配合共享订阅 `$share/group/topic` 使用）。
          *
-         * <p>注意：本方法由 Paho 内部线程回调，若业务逻辑较重（例如耗时的 DB 操作），建议将
-         * 耗时处理提交到自定义线程池，避免阻塞同一 client 的其他消息处理。
+         * <p>注意：本方法由 Paho 内部线程回调，若业务逻辑较重（例如耗时的 DB 操作），
+         * 建议将耗时处理提交到自定义线程池，避免阻塞同一 client 的其他消息处理。
          *
          * @param topic   实际主题名
          * @param message 原始 MQTT 消息（含 payload 与 qos 等）
-         * @param util    当前订阅者实例，便于在回调中调用 publish / requeue 等工具方法
          * @throws Exception 业务异常；抛出后消息不会自动重复消费（Paho 已自动 ACK），
-         *                   如需重试请在 catch 中显式调用 {@code util.requeue(topic, message)}。
+         *                   如需"失败交给其他实例重试"，请在 catch 中用独立发布端重新发回原主题。
          */
-        void handle(String topic, MqttMessage message, MqttSubscribeUtil util) throws Exception;
+        void handle(String topic, MqttMessage message) throws Exception;
     }
 
     /**
@@ -186,10 +190,8 @@ public class MqttSubscribeUtil implements AutoCloseable {
                 }
 
                 /**
-                 * 发送完成回调。订阅端通常不主动发消息，
-                 * 但通过 {@link MqttSubscribeUtil#publish(String, QosLevel, String)} 或
-                 * {@link MqttSubscribeUtil#requeue(String, MqttMessage)} 发出的消息
-                 * 完成握手后会走到这里。用户传入 deliveryCompleteHandler 则调用，否则空实现。
+                 * 发送完成回调。订阅端不主动发消息，此回调在本工具类中通常不会触发；
+                 * 保留用于扩展或与其他组件集成。用户未传入 deliveryCompleteHandler 时空实现。
                  */
                 @Override
                 public void deliveryComplete(IMqttDeliveryToken token) {
@@ -209,14 +211,13 @@ public class MqttSubscribeUtil implements AutoCloseable {
                  * <p>handler 中你可以：
                  * <ul>
                  *   <li>做业务处理（入库、验证等）；</li>
-                 *   <li>处理中如需下发指令给终端设备，可调用 {@code util.publish("command/xxx", QosLevel.AT_LEAST_ONCE, "cmd")}；</li>
-                 *   <li>业务失败时可调用 {@code util.requeue(topic, message)} 把消息重新发回原主题，
-                 *       让 broker 按共享订阅规则重新负载均衡到同组的其他订阅者。</li>
+                 *   <li>如需下发指令给终端或把失败消息重新发回原主题，
+                 *       请使用外部独立的 {@link MqttPublishUtil}，不要占用订阅端的连接。</li>
                  * </ul>
                  */
                 @Override
                 public void messageArrived(String topic, MqttMessage message) throws Exception {
-                    handler.handle(topic, message, MqttSubscribeUtil.this);
+                    handler.handle(topic, message);
                 }
             });
 
@@ -279,141 +280,7 @@ public class MqttSubscribeUtil implements AutoCloseable {
     }
 
     /**
-     * 把消息原封不动重新发布到原主题 —— 用于"业务失败时交给同组其他订阅者重试"。
-     *
-     * <p>典型使用场景（配合共享订阅）：
-     * <pre>
-     * (topic, message, util) -> {
-     *     try {
-     *         // 业务处理：入库、解析、验证等
-     *     } catch (Exception e) {
-     *         // 业务失败：把消息重新发回原主题，让同组其他订阅者继续处理
-     *         util.requeue(topic, message);
-     *     }
-     * }
-     * </pre>
-     *
-     * <p>工作原理：本实例作为 MQTT 客户端向原主题发送一条新消息（保留原 payload 和 qos），
-     * broker 收到后按共享订阅规则重新负载均衡到同组的某个订阅者（可能就是本实例，也可能是其他实例）。
-     * 建议配合共享订阅前缀 {@code $share/group/topic} 使用，避免所有实例都收到一次。
-     *
-     * <p>与 {@link #publish(String, QosLevel, String)} 的区别：
-     * <ul>
-     *   <li>{@code requeue}：语义为"把原消息重新入队（重发到原主题）"，复用原消息的 payload 与 qos，
-     *       专为失败重试场景设计。</li>
-     *   <li>{@code publish}：语义为"下发一条新消息给终端设备"，参数完全自定义，
-     *       适合在消息处理中对终端下发指令。</li>
-     * </ul>
-     *
-     * @param topic   消息到达时的实际主题名（原样回传即可）
-     * @param message 原消息对象（保留 payload、qos 等元信息）
-     * @throws IllegalArgumentException topic / message 为 null，或 topic 为空
-     * @throws RuntimeException         底层 MqttException（网络、权限、超时等）的封装
-     */
-    public void requeue(String topic, MqttMessage message) {
-        if (topic == null || topic.isEmpty()) throw new IllegalArgumentException("topic 不能为空");
-        if (message == null) throw new IllegalArgumentException("message 不能为 null");
-        // 复用原消息的 payload 与 qos；对 broker 而言这是一条独立的新消息
-        byte[] payload = message.getPayload() != null ? message.getPayload() : new byte[0];
-        int qos = message.getQos();
-
-        try {
-            MqttMessage msg = new MqttMessage(payload);
-            msg.setQos(qos);
-            // 使用本实例自身作为发布者发回原主题；发送完成后会回调 deliveryCompleteHandler（若有）
-            client.publish(topic, msg);
-            log.info("[MqttSubscribeUtil] requeue：消息已重新发布到原主题 topic={} qos={} payloadLen={}",
-                    topic, qos, payload.length);
-        } catch (MqttException e) {
-            log.error("[MqttSubscribeUtil] requeue 失败 topic={} qos={} reasonCode={} {}",
-                    topic, qos, e.getReasonCode(), e.getMessage());
-            throw new RuntimeException("requeue 失败: " + e.getMessage(), e);
-        }
-    }
-
-
-    /**
-     * 同步发送一条字符串消息 —— 用于在消息处理过程中下发指令给终端设备或广播结果。
-     *
-     * <p>内部实现：将 {@code msg} 按 UTF-8 编码为字节数组后，委托给
-     * {@link #publish(String, QosLevel, byte[])} 统一处理。
-     *
-     * <p>典型使用场景：监听到终端上报状态后，根据业务规则下发控制指令（如 {@code command/did-xxxx}）。
-     * <pre>
-     * (topic, message, util) -> {
-     *     // 处理完毕后下发一条文本指令
-     *     util.publish("command/did-" + message.getId(), QosLevel.AT_LEAST_ONCE, "do_something");
-     * }
-     * </pre>
-     *
-     * <p>阻塞行为说明（依赖于 QoS）：
-     * <ul>
-     *   <li>QoS 0：消息写入底层 socket 后几乎立即返回；broker 与订阅端是否收到不可靠。</li>
-     *   <li>QoS 1：阻塞直到收到 broker 的 PUBACK；超时未收到时底层按 automaticReconnect 策略自动重连并重发。</li>
-     *   <li>QoS 2：阻塞直到四次握手完成（PUBLISH → PUBREC → PUBREL → PUBCOMP），协议层保证"不丢、不重"。</li>
-     * </ul>
-     *
-     * <p><b>注意</b>：本方法在消息处理线程（Paho 的回调线程）中同步调用，因此会阻塞当前消息的处理。
-     * 如果下发指令非常耗时或 broker 响应慢，可能影响后续消息处理速度；可考虑将下发逻辑提交到自定义线程池，
-     * 或使用 {@link MqttPublishUtil} 单独的发布客户端（避免与订阅共用一个连接）。
-     *
-     * @param topic 目标主题（通常是终端设备的指令主题，例如 {@code command/did-xxx}），非空、非 null
-     * @param qos   消息服务质量等级，由 {@link QosLevel} 保证合法取值
-     * @param msg   消息内容（字符串，按 UTF-8 编码为字节数组），不允许 null
-     * @throws IllegalArgumentException topic / qos / msg 非法
-     * @throws RuntimeException         底层 MqttException（网络、权限、超时等）的封装
-     */
-    public void publish(String topic, QosLevel qos, String msg) {
-        if (msg == null) throw new IllegalArgumentException("msg 不能为 null");
-        // 字符串消息：按 UTF-8 编码后，统一委托给二进制版本处理
-        publish(topic, qos, msg.getBytes(StandardCharsets.UTF_8));
-    }
-
-
-    /**
-     * 同步发送一条二进制消息 —— 适用于下发 protobuf、压缩包、图片、自定义二进制协议等非字符串场景。
-     *
-     * <p>典型使用场景：监听到终端上报后，根据业务规则下发二进制指令（例如 protobuf 响应、固件分片等）。
-     * <pre>
-     * byte[] bin = MyProto.newBuilder().setDid("did-123").setCmd("open").build().toByteArray();
-     * util.publish("device/did-123/cmd", QosLevel.AT_LEAST_ONCE, bin);
-     * </pre>
-     *
-     * <p>阻塞行为说明（依赖于 QoS）：
-     * <ul>
-     *   <li>QoS 0：消息写入底层 socket 后几乎立即返回；broker 与订阅端是否收到不可靠。</li>
-     *   <li>QoS 1：阻塞直到收到 broker 的 PUBACK；超时未收到时底层按 automaticReconnect 策略自动重连并重发。</li>
-     *   <li>QoS 2：阻塞直到四次握手完成（PUBLISH → PUBREC → PUBREL → PUBCOMP），协议层保证"不丢、不重"。</li>
-     * </ul>
-     *
-     * @param topic   目标主题，非空、非 null
-     * @param qos     消息服务质量等级，由 {@link QosLevel} 保证合法取值
-     * @param payload 二进制消息体；允许 null，内部会以空数组 {@code new byte[0]} 兜底
-     * @throws IllegalArgumentException topic / qos 非法
-     * @throws RuntimeException         底层 MqttException（网络、权限、超时等）的封装
-     */
-    public void publish(String topic, QosLevel qos, byte[] payload) {
-        if (topic == null || topic.isEmpty()) throw new IllegalArgumentException("topic 不能为空");
-        if (qos == null) throw new IllegalArgumentException("qos 不能为 null");
-        // payload 允许 null，此处做一次兜底，避免传入 null 时底层抛出 NPE
-        byte[] bytes = payload != null ? payload : new byte[0];
-
-        MqttMessage message = new MqttMessage(bytes);
-        message.setQos(qos.value());
-
-        try {
-            client.publish(topic, message);
-            log.debug("[MqttSubscribeUtil] publish 完成 topic={} qos={} payloadLen={}",
-                    topic, qos, bytes.length);
-        } catch (MqttException e) {
-            log.error("[MqttSubscribeUtil] publish 异常 topic={} qos={} reasonCode={} {}",
-                    topic, qos, e.getReasonCode(), e.getMessage());
-            throw new RuntimeException("publish 失败: " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 返回本实例实际使用的 clientId（来自用户显式设置或自动生成）。
+     * 返回本实例实际使用的 clientId（来自用户显式设置）。
      *
      * @return clientId
      */
@@ -471,19 +338,6 @@ public class MqttSubscribeUtil implements AutoCloseable {
     }
 
     /**
-     * 生成 clientId：前缀 + UUID（去连字符），总长度截断到 {@link #MAX_CLIENT_ID_LENGTH}。
-     *
-     * <p>发布端前缀 {@code pub}，订阅端前缀 {@code sub}，便于在 broker 日志中区分两类客户端。
-     *
-     * @param prefix 标识前缀，null 或空时降级为 {@code mqtt}
-     * @return 形如 {@code sub-0a1b2c3d4e5f6a7b8c} 的 clientId，长度 ≤ 23
-     */
-    static String generateClientId(String prefix) {
-        String base = (prefix == null ? "mqtt" : prefix) + "-" + UUID.randomUUID().toString().replace("-", "");
-        return base.length() > MAX_CLIENT_ID_LENGTH ? base.substring(0, MAX_CLIENT_ID_LENGTH) : base;
-    }
-
-    /**
      * 获取 Builder 实例，用于链式构造 {@link MqttSubscribeUtil}。
      *
      * @return 全新的 {@link Builder}
@@ -499,11 +353,12 @@ public class MqttSubscribeUtil implements AutoCloseable {
      *
      * <p>典型用法：
      * <pre>
+     * // 注意：订阅端只做"收消息"，发布消息或下发指令请用独立的 MqttPublishUtil
      * try (MqttSubscribeUtil consumer = MqttSubscribeUtil.builder()
      *         .setBroker("tcp://broker:1883")
      *         .setClientId("my-consumer")
-     *         .setMessageHandler((topic, message, util) -> {
-     *             // 业务逻辑
+     *         .setMessageHandler((topic, message) -> {
+     *             // 业务处理
      *         })
      *         .build()) {
      *     consumer.subscribe("$share/group1/order/created", QosLevel.AT_LEAST_ONCE);
@@ -520,7 +375,8 @@ public class MqttSubscribeUtil implements AutoCloseable {
         String broker = "tcp://broker.emqx.io:1883";
 
         /**
-         * 客户端标识。build 时未设置则自动生成 {@code sub-<UUID 截断>}。
+         * 客户端标识。必须显式传入固定值（例如 {@code order-service-consumer-01}），
+         * 并在多次启动时保持一致，否则 cleanSession=false 场景下断线重连期间的消息会丢失。
          */
         String clientId;
 
@@ -567,7 +423,9 @@ public class MqttSubscribeUtil implements AutoCloseable {
         Consumer<Throwable> connectionLostHandler;
 
         /**
-         * 发送完成回调。可选；订阅端通常不需要，仅当需要跟踪 republish 的发送完成时使用。
+         * 发送完成回调。可选；订阅端不主动发消息，该回调在本工具类中通常不会触发。
+         * 如果外部还有独立的 MqttPublishUtil 实例需要跟踪发送完成，
+         * 可在外部单独注册其回调。
          */
         Consumer<IMqttDeliveryToken> deliveryCompleteHandler;
 
@@ -583,13 +441,10 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         /**
-         * 设置 clientId。
+         * 设置 clientId。订阅端默认 cleanSession=false，必须显式传入固定值，
+         * 并在多次启动时保持一致，否则 broker 无法匹配旧会话，断线重连期间的消息会丢失。
          *
-         * <p>cleanSession=false 时强烈建议显式设置"服务名 + 实例编号"形式的固定值
-         * （如 {@code order-service-consumer-01}），以便 broker 按固定 clientId 持久化会话；
-         * 未设置时 {@link #build()} 会自动生成 {@code sub-<UUID 截断>}。
-         *
-         * @param clientId 客户端标识（长度 ≤ 23，超出会在 build 时抛异常）
+         * @param clientId 客户端标识（不能为空，且长度 ≤ 23 字节；超出或为空会在 build 时抛异常）
          * @return this 链式调用
          */
         public Builder setClientId(String clientId) {
@@ -684,21 +539,22 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         /**
-         * 设置消息处理器（<b>必需项</b>）。只需实现一个方法；第三个参数 {@code util} 即本实例，
-         * 业务失败时可调用 {@code util.requeue(topic, message)} 重试，或在处理中调用
-         * {@code util.publish("command/xxx", QosLevel.AT_LEAST_ONCE, "cmd")} 下发指令。
+         * 设置消息处理器（<b>必需项</b>）。只需实现一个方法；
+         * 注意：订阅端只负责"收消息"，如需下发指令或把失败消息重新发布，
+         * 请在外部构建独立的 {@link MqttPublishUtil} 实例。
          *
          * <p>示例：
          * <pre>
-         * builder.setMessageHandler((topic, message, util) -> {
+         * builder.setMessageHandler((topic, message) -> {
          *     try {
          *         // 业务处理：入库、解析、验证等
          *         String payload = new String(message.getPayload());
-         *         // 处理中可以下发指令给终端设备
-         *         util.publish("command/did-" + message.getId(), QosLevel.AT_LEAST_ONCE, "do_something");
+         *         // 如需下发指令或发布失败消息，请使用外部独立的 MqttPublishUtil
+         *         // producer.publish("command/did-" + message.getId(), QosLevel.AT_LEAST_ONCE, "do_something");
          *     } catch (Exception e) {
-         *         // 业务失败：把消息重新发回原主题，交给同组其他订阅者继续处理
-         *         util.requeue(topic, message);
+         *         // 如需"失败交给同组其他实例处理"，可使用外部独立的 MqttPublishUtil
+         *         // 把原消息重新发回原主题（配合共享订阅 $share/group/topic）
+         *         // producer.publish(topic, QosLevel.AT_LEAST_ONCE, message.getPayload());
          *     }
          * });
          * </pre>
@@ -727,10 +583,8 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         /**
-         * 自定义发送确认回调。订阅端通常不需要；当使用
-         * {@link MqttSubscribeUtil#publish(String, QosLevel, String)} 下发指令或
-         * {@link MqttSubscribeUtil#requeue(String, MqttMessage)} 把消息重新发出后，
-         * 可在这里跟踪发送完成情况。不传则空实现。
+         * 自定义发送确认回调。订阅端本身不主动发消息，此回调在本工具类中通常不会触发；
+         * 保留用于扩展。如果需要跟踪发布端发送完成情况，请在 {@link MqttPublishUtil} 侧设置相关回调。
          *
          * @param handler 收到发送完成的 token（可从中获取 messageId、topic 等信息）
          * @return this 链式调用
@@ -745,7 +599,9 @@ public class MqttSubscribeUtil implements AutoCloseable {
          *
          * <p>执行逻辑：
          * <ol>
-         *   <li>若 clientId 未设置 → 自动生成 {@code sub-<UUID 截断>}（≤23 字节）。</li>
+         *   <li>若 clientId 未设置或为空 → 抛 {@link IllegalArgumentException}（订阅端默认
+         *       cleanSession=false，必须使用固定 clientId，否则断线重连时 broker 无法匹配旧会话，
+         *       缓存的订阅关系与未推送的消息都会丢失）。</li>
          *   <li>若用户传入的 clientId 超出 23 字节 → 抛 {@link IllegalArgumentException}。</li>
          *   <li>若 messageHandler 未设置 → 抛 {@link IllegalArgumentException}（必须有处理器）。</li>
          *   <li>创建底层 {@link MqttClient}，设置 {@link MqttCallback} 并调用 connect()，
@@ -758,9 +614,11 @@ public class MqttSubscribeUtil implements AutoCloseable {
          */
         public MqttSubscribeUtil build() {
             if (clientId == null || clientId.isEmpty()) {
-                clientId = generateClientId("sub");
-                log.info("[MqttSubscribeUtil] 未设置 clientId，已自动生成：{}", clientId);
-            } else if (clientId.length() > MAX_CLIENT_ID_LENGTH) {
+                throw new IllegalArgumentException("clientId 不能为空：订阅端默认 cleanSession=false，" +
+                        "必须显式传入固定 clientId（例如 \"order-service-consumer-01\"），" +
+                        "否则断线重连时 broker 无法匹配旧会话，缓存的订阅关系与未推送消息都会丢失。");
+            }
+            if (clientId.length() > MAX_CLIENT_ID_LENGTH) {
                 throw new IllegalArgumentException("clientId 超出最大长度 " + MAX_CLIENT_ID_LENGTH
                         + " 字节：当前长度 " + clientId.length() + "，值=\"" + clientId + "\"");
             }
