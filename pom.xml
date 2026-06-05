@@ -164,6 +164,11 @@
                                     <pattern>org.ttzero</pattern>
                                     <shadedPattern>relocations.${project.groupId}.org.ttzero</shadedPattern>
                                 </relocation>
+                                <!-- paho 相关包 -->
+                                <relocation>
+                                    <pattern>org.eclipse.paho</pattern>
+                                    <shadedPattern>relocations.${project.groupId}.org.eclipse.paho</shadedPattern>
+                                </relocation>
                             </relocations>
                             <transformers>
                                 <!-- 合并META-INF/services文件（插件会自动根据relocation重写类名） -->

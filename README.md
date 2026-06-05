@@ -20,17 +20,12 @@
 ## 依赖
 
 ```xml
-<!-- 引入 Eclipse Paho 客户端与 hutool（工具类内部使用 hutool 日志） -->
 <dependency>
-    <groupId>org.eclipse.paho</groupId>
-    <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
-    <version>1.2.5</version>
-</dependency>
-
-<dependency>
-    <groupId>cn.hutool</groupId>
-    <artifactId>hutool-all</artifactId>
-    <version>5.8.x</version>
+    <groupId>sunyu.util</groupId>
+    <artifactId>util-mqtt</artifactId>
+    <!-- {paho.version}_{util.version}_{jdk.version} -->
+    <version>1.2.5_1.0_jdk8</version>
+    <classifier>shaded</classifier>
 </dependency>
 ```
 
