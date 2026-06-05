@@ -7,6 +7,7 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import sunyu.util.mqtt.QosLevel;
 
 import java.util.function.Consumer;
+import java.util.UUID;
 
 /**
  * MQTT 订阅消费端工具类 —— 基于同步客户端 {@link MqttClient}。
@@ -16,7 +17,8 @@ import java.util.function.Consumer;
  *   <li>{@code cleanSession 默认 false}：broker 记住本 clientId 的订阅和未 ACK 消息；重连后继续推送。</li>
  *   <li><b>自动 ACK</b>：消息交给 handler 后由 Paho 自动确认。</li>
  *   <li>{@code automaticReconnect = true}：底层网络断开时自动指数退避重连。</li>
- *   <li>{@code clientId 必须固定且唯一}（配合 cleanSession=false）。</li>
+ *   <li>{@code clientId 默认自动生成}（"sub-" + UUID 前缀，确保 ≤ 23 字节）；
+ *       如需 broker 记住会话（cleanSession=false），请显式设置固定且唯一的 clientId。</li>
  *   <li><b>消息处理器必须通过 {@link Builder#setMessageHandler(MessageHandler)} 传入</b>：
  *       第三个参数 util 就是本实例本身，可以直接调 util.republish(...)；
  *       connectionLost / deliveryComplete 可通过另外两个 setter 按需自定义。</li>
@@ -48,6 +50,9 @@ import java.util.function.Consumer;
 public class MqttSubscribeUtil implements AutoCloseable {
 
     private static final Log log = LogFactory.get();
+
+    /** MQTT 3.1.1 规范限制 clientId 最大 23 字节；很多 broker 仍沿用此限制。 */
+    private static final int MAX_CLIENT_ID_LENGTH = 23;
 
     private final MqttClient client;
     private final String clientId;
@@ -207,6 +212,12 @@ public class MqttSubscribeUtil implements AutoCloseable {
         log.info("[MqttSubscribeUtil] 关闭完成 clientId={}", clientId);
     }
 
+    /** 生成 clientId：prefix + UUID 截断，确保 ≤ MAX_CLIENT_ID_LENGTH。 */
+    static String generateClientId(String prefix) {
+        String base = (prefix == null ? "mqtt" : prefix) + "-" + UUID.randomUUID().toString().replace("-", "");
+        return base.length() > MAX_CLIENT_ID_LENGTH ? base.substring(0, MAX_CLIENT_ID_LENGTH) : base;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -323,8 +334,13 @@ public class MqttSubscribeUtil implements AutoCloseable {
         }
 
         public MqttSubscribeUtil build() {
-            if (clientId == null || clientId.isEmpty())
-                throw new IllegalArgumentException("clientId 不能为空（消费端必须固定且唯一）");
+            if (clientId == null || clientId.isEmpty()) {
+                clientId = generateClientId("sub");
+                log.info("[MqttSubscribeUtil] 未设置 clientId，已自动生成：{}", clientId);
+            } else if (clientId.length() > MAX_CLIENT_ID_LENGTH) {
+                throw new IllegalArgumentException("clientId 超出最大长度 " + MAX_CLIENT_ID_LENGTH
+                        + " 字节：当前长度 " + clientId.length() + "，值=\"" + clientId + "\"");
+            }
             if (messageHandler == null)
                 throw new IllegalArgumentException("messageHandler 不能为空：必须通过 setMessageHandler(...) 传入");
             return new MqttSubscribeUtil(this);

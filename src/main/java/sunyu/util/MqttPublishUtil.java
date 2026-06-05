@@ -11,11 +11,14 @@ import sunyu.util.mqtt.QosLevel;
 
 import java.nio.charset.StandardCharsets;
 
+import java.util.UUID;
+
 /**
  * MQTT <b>消息生产者</b>工具类 —— 基于同步客户端 {@link MqttClient}，专用于发送消息。
  *
- * <p><b>关键配置</b>（由 Builder 传入）：
+ * <p><b>关键配置</b>（由 Builder 传入，未设置则自动生成/使用默认值）：
  * <ul>
+ *   <li>{@code clientId 默认自动生成}（"pub-" + UUID 前缀，确保 ≤ 23 字节）。</li>
  *   <li>{@code cleanSession = true}（硬编码）：发送端是"即用即走"模式，broker 不需要记住本客户端。</li>
  *   <li>{@code automaticReconnect = true}：底层网络断开时自动指数退避重连。</li>
  *   <li>{@code MemoryPersistence}：本地缓存未完成的 QoS 1/2 消息，重连后自动重试。</li>
@@ -41,6 +44,9 @@ import java.nio.charset.StandardCharsets;
 public class MqttPublishUtil implements AutoCloseable {
 
     private static final Log log = LogFactory.get();
+
+    /** MQTT 3.1.1 规范限制 clientId 最大 23 字节；很多 broker 仍沿用此限制。 */
+    private static final int MAX_CLIENT_ID_LENGTH = 23;
 
     private final MqttClient client;
     private final String clientId;
@@ -125,6 +131,12 @@ public class MqttPublishUtil implements AutoCloseable {
         log.info("[MqttPublishUtil] 关闭完成 clientId={}", clientId);
     }
 
+    /** 生成 clientId：prefix + UUID 截断，确保 ≤ MAX_CLIENT_ID_LENGTH。 */
+    static String generateClientId(String prefix) {
+        String base = (prefix == null ? "mqtt" : prefix) + "-" + UUID.randomUUID().toString().replace("-", "");
+        return base.length() > MAX_CLIENT_ID_LENGTH ? base.substring(0, MAX_CLIENT_ID_LENGTH) : base;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -193,8 +205,13 @@ public class MqttPublishUtil implements AutoCloseable {
         }
 
         public MqttPublishUtil build() {
-            if (clientId == null || clientId.isEmpty())
-                throw new IllegalArgumentException("clientId 不能为空");
+            if (clientId == null || clientId.isEmpty()) {
+                clientId = generateClientId("pub");
+                log.info("[MqttPublishUtil] 未设置 clientId，已自动生成：{}", clientId);
+            } else if (clientId.length() > MAX_CLIENT_ID_LENGTH) {
+                throw new IllegalArgumentException("clientId 超出最大长度 " + MAX_CLIENT_ID_LENGTH
+                        + " 字节：当前长度 " + clientId.length() + "，值=\"" + clientId + "\"");
+            }
             return new MqttPublishUtil(broker, clientId, username, password,
                     cleanSession, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds);
         }
