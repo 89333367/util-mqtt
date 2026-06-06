@@ -7,6 +7,7 @@ import org.eclipse.paho.mqttv5.client.MqttConnectionOptions;
 import org.eclipse.paho.mqttv5.client.persist.MemoryPersistence;
 import org.eclipse.paho.mqttv5.common.MqttException;
 import org.eclipse.paho.mqttv5.common.MqttMessage;
+import org.eclipse.paho.mqttv5.common.packet.MqttProperties;
 import sunyu.util.mqtt.QosLevel;
 
 import java.nio.charset.StandardCharsets;
@@ -33,7 +34,10 @@ import java.util.UUID;
  *       但为兼容多数 broker（EMQX / Mosquitto / HiveMQ）限制到 23 字节；
  *       建议在真实项目中显式设置"服务名 + 实例编号"形式的固定值，便于排查。</li>
  *   <li>{@code username / password}：默认 null，broker 开启鉴权时必须设置；密码在日志中脱敏为 {@code *****}。</li>
- *   <li>{@code cleanStart}：默认 true —— 发布端即用即走，broker 不需要为该 clientId 保留会话。</li>
+ *   <li>{@code cleanStart}：默认 true —— 发布端即用即走，broker 不需要为该 clientId 保留会话；
+ *       如需"同一个发布端跨重启保证消息不丢"，可设为 false 并配合 {@code sessionExpiryIntervalSeconds}。</li>
+ *   <li>{@code sessionExpiryIntervalSeconds}：默认 0 —— MQTT 5 独有，broker 在断开后保留该
+ *       clientId 会话的最长秒数；cleanStart=true 时通常保持 0，cleanStart=false 时建议配大一些。</li>
  *   <li>{@code automaticReconnect}：默认 true —— 底层网络抖动时以指数退避自动重连。</li>
  *   <li>{@code connectionTimeoutSeconds}：默认 30 秒 —— connect() 的同步阻塞超时。</li>
  *   <li>{@code keepAliveIntervalSeconds}：默认 60 秒 —— PINGREQ 心跳间隔，保持防火墙会话活跃。</li>
@@ -93,38 +97,46 @@ public class MqttPublishUtil implements AutoCloseable {
      *   <li>任何 {@link MqttException} 发生时记录 error 日志（附带 reasonCode），封装为 {@link RuntimeException} 抛出。</li>
      * </ol>
      *
-     * @param broker                   broker 连接地址（如 {@code tcp://host:1883}）
-     * @param clientId                 客户端标识（≤23 字节）
-     * @param username                 鉴权用户名，可为 null
-     * @param password                 鉴权密码（char[]），可为 null
-     * @param cleanStart               是否启用 clean start（对应 MQTT 5 Clean Start）
-     * @param automaticReconnect       是否开启底层自动重连
-     * @param connectionTimeoutSeconds connect 超时秒数
-     * @param keepAliveIntervalSeconds 心跳间隔秒数
+     * @param broker                       broker 连接地址（如 {@code tcp://host:1883}）
+     * @param clientId                     客户端标识（≤23 字节）
+     * @param username                     鉴权用户名，可为 null
+     * @param password                     鉴权密码（char[]），可为 null
+     * @param cleanStart                   是否启用 clean start（对应 MQTT 5 Clean Start）
+     * @param automaticReconnect           是否开启底层自动重连
+     * @param connectionTimeoutSeconds     connect 超时秒数
+     * @param keepAliveIntervalSeconds     心跳间隔秒数
+     * @param sessionExpiryIntervalSeconds 会话过期秒数（MQTT 5 独有；v3 没有）
      */
     private MqttPublishUtil(String broker, String clientId, String username, char[] password,
                             boolean cleanStart, boolean automaticReconnect, int connectionTimeoutSeconds,
-                            int keepAliveIntervalSeconds) {
+                            int keepAliveIntervalSeconds, long sessionExpiryIntervalSeconds) {
         this.clientId = clientId;
 
         try {
             // MemoryPersistence：进程内缓存 QoS 1/2 未完成消息；进程重启后丢失
             client = new MqttClient(broker, clientId, new MemoryPersistence());
 
-            // 组装 MqttConnectionOptions：所有参数由 Builder 传入
+            // 组装 MqttConnectionOptions（MQTT 5 版本）：
+            // 除 cleanStart/automaticReconnect/心跳/鉴权等基础字段外，
+            // 还通过 setSessionExpiryInterval 启用 MQTT 5 的会话过期机制（v3 没有），
+            // 使同一 clientId 跨重启仍能保留未完成的 QoS 1/2 消息时间窗口可控。
             MqttConnectionOptions options = new MqttConnectionOptions();
             options.setCleanStart(cleanStart);
             options.setAutomaticReconnect(automaticReconnect);
             options.setConnectionTimeout(connectionTimeoutSeconds);
             options.setKeepAliveInterval(keepAliveIntervalSeconds);
+            options.setSessionExpiryInterval(sessionExpiryIntervalSeconds);
             if (username != null) options.setUserName(username);
-            if (password != null) options.setPassword(new String(password).getBytes(StandardCharsets.UTF_8));
+            if (password != null)
+                options.setPassword(new String(password).getBytes(StandardCharsets.UTF_8));
 
             // 打印初始化全部参数（password 脱敏），便于问题定位
             log.info("[MqttPublishUtil] 开始连接 broker={} clientId={} username={} password={} " +
-                            "cleanStart={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={}",
+                            "cleanStart={} automaticReconnect={} connectionTimeoutSec={} " +
+                            "keepAliveIntervalSec={} sessionExpiryIntervalSec={}",
                     broker, clientId, username, password != null ? "*****" : "null",
-                    cleanStart, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds);
+                    cleanStart, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds,
+                    sessionExpiryIntervalSeconds);
 
             // 阻塞直到收到 CONNACK 或超时；失败抛 MqttException
             client.connect(options);
@@ -159,11 +171,11 @@ public class MqttPublishUtil implements AutoCloseable {
     public void publish(String topic, QosLevel qos, String msg) {
         if (msg == null) throw new IllegalArgumentException("msg 不能为 null");
         // 字符串消息：按 UTF-8 编码后，统一委托给二进制版本处理
-        publish(topic, qos, msg.getBytes(StandardCharsets.UTF_8));
+        publish(topic, qos, msg.getBytes(StandardCharsets.UTF_8), null, false);
     }
 
     /**
-     * 同步发送一条二进制消息 —— 适用于下发 protobuf、压缩包、图片、自定义二进制协议等非字符串场景。
+     * 同步发送一条二进制消息 —— 适用于下发 protobuf、压缩包、图片、固件分片等非字符串场景。
      *
      * <p>典型使用场景：
      * <pre>
@@ -185,18 +197,62 @@ public class MqttPublishUtil implements AutoCloseable {
      * @throws RuntimeException         底层 MqttException（含网络、权限、超时等）的封装
      */
     public void publish(String topic, QosLevel qos, byte[] payload) {
+        publish(topic, qos, payload, null, false);
+    }
+
+    /**
+     * 同步发送一条二进制消息（支持 MQTT 5 的 {@link MqttProperties}，可附加 userProperty、
+     * messageExpiryInterval、responseTopic、correlationData 等协议级元数据，不污染 payload）。
+     *
+     * <p>典型使用场景：
+     * <pre>
+     * MqttProperties props = new MqttProperties();
+     * props.setUserProperty("requestId", "123456");     // 自定义业务参数
+     * props.setMessageExpiryInterval(3600L);             // 消息过期（秒，v5 独有）
+     * producer.publish("device/cmd/did-123", QosLevel.AT_LEAST_ONCE, payload, props);
+     * </pre>
+     *
+     * @param topic      目标主题，非空、非 null
+     * @param qos        消息服务质量等级，由 {@link QosLevel} 保证合法取值
+     * @param payload    二进制消息体；允许 null，内部会以空数组 {@code new byte[0]} 兜底
+     * @param properties MQTT 5 消息属性（userProperty / messageExpiryInterval / responseTopic 等）；
+     *                   为 null 时等同于 {@link #publish(String, QosLevel, byte[])}
+     * @throws IllegalArgumentException topic / qos 非法
+     * @throws RuntimeException         底层 MqttException（含网络、权限、超时等）的封装
+     */
+    public void publish(String topic, QosLevel qos, byte[] payload, MqttProperties properties) {
+        publish(topic, qos, payload, properties, false);
+    }
+
+    /**
+     * 核心发送入口：统一组装 {@link MqttMessage} 并调用底层 client 发出。
+     *
+     * <p>关于 MQTT 5 {@code retained}：
+     * 设置 true 时 broker 会为该主题保留最后一条消息，新订阅者首次订阅时会立即收到该保留消息；
+     * 适合"状态上报"类主题（如设备在线状态），对普通"事件类"消息通常保持 false。
+     *
+     * @param topic      目标主题，非空、非 null
+     * @param qos        消息服务质量等级，由 {@link QosLevel} 保证合法取值
+     * @param payload    二进制消息体；允许 null，内部会以空数组 {@code new byte[0]} 兜底
+     * @param properties MQTT 5 消息属性；为 null 时不附加属性
+     * @param retained   是否保留消息（broker 为该主题缓存，新订阅者立即收到）
+     */
+    private void publish(String topic, QosLevel qos, byte[] payload, MqttProperties properties, boolean retained) {
         if (topic == null || topic.isEmpty()) throw new IllegalArgumentException("topic 不能为空");
         if (qos == null) throw new IllegalArgumentException("qos 不能为 null");
         // payload 允许 null，此处做一次兜底，避免传入 null 时底层抛出 NPE
         byte[] bytes = payload != null ? payload : new byte[0];
 
+        // 使用 Paho v5 的 MqttMessage + setProperties，统一承载 payload / qos / retained / properties
         MqttMessage message = new MqttMessage(bytes);
         message.setQos(qos.value());
+        message.setRetained(retained);
+        if (properties != null) message.setProperties(properties);
 
         try {
             client.publish(topic, message);
-            log.debug("[MqttPublishUtil] publish 完成 topic={} qos={} payloadLen={}",
-                    topic, qos, bytes.length);
+            log.debug("[MqttPublishUtil] publish 完成 topic={} qos={} retained={} payloadLen={}",
+                    topic, qos, retained, bytes.length);
         } catch (MqttException e) {
             log.error("[MqttPublishUtil] publish 异常 topic={} qos={} reasonCode={} {}",
                     topic, qos, e.getReasonCode(), e.getMessage());
@@ -322,6 +378,12 @@ public class MqttPublishUtil implements AutoCloseable {
         private boolean cleanStart = true;
 
         /**
+         * MQTT 5 会话过期间隔（秒）。默认 0（即 cleanStart=true 时通常为 0；
+         * 若显式把 cleanStart 设为 false 可配大一点来让 broker 缓存会话）。
+         */
+        private long sessionExpiryIntervalSeconds = 0L;
+
+        /**
          * 设置 broker 连接地址。
          *
          * @param broker 如 {@code tcp://host:1883}、{@code ssl://host:8883}
@@ -436,6 +498,18 @@ public class MqttPublishUtil implements AutoCloseable {
         }
 
         /**
+         * 设置 MQTT 5 会话过期间隔（秒）。发布端默认 0（即 cleanStart=true 时通常为 0），
+         * 若显式把 cleanStart 设为 false 可配大一点来让 broker 缓存会话。
+         *
+         * @param sessionExpiryIntervalSeconds 会话过期间隔（秒）
+         * @return this 链式调用
+         */
+        public Builder setSessionExpiryIntervalSeconds(long sessionExpiryIntervalSeconds) {
+            this.sessionExpiryIntervalSeconds = sessionExpiryIntervalSeconds;
+            return this;
+        }
+
+        /**
          * 构造并连接 MQTT 发布客户端，返回可用的 {@link MqttPublishUtil} 实例。
          *
          * <p>执行逻辑：
@@ -458,7 +532,8 @@ public class MqttPublishUtil implements AutoCloseable {
                         + " 字节：当前长度 " + clientId.length() + "，值=\"" + clientId + "\"");
             }
             return new MqttPublishUtil(broker, clientId, username, password,
-                    cleanStart, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds);
+                    cleanStart, automaticReconnect, connectionTimeoutSeconds, keepAliveIntervalSeconds,
+                    sessionExpiryIntervalSeconds);
         }
     }
 }

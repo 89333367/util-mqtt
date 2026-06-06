@@ -36,6 +36,8 @@ import java.util.function.Consumer;
  *       一旦 clientId 变化，broker 无法匹配旧会话，断线重连期间的消息会丢失。</li>
  *   <li>{@code username / password}：默认 null，broker 开启鉴权时必须设置；密码在日志中脱敏为 {@code *****}。</li>
  *   <li>{@code cleanStart}：默认 false —— broker 记住本 clientId 的订阅与未 ACK 消息。</li>
+ *   <li>{@code sessionExpiryIntervalSeconds}：默认 3600 秒（1 小时）—— MQTT 5 独有，
+ *       超过该时长仍未重连，broker 丢弃本 clientId 的会话与离线消息。</li>
  *   <li>{@code automaticReconnect}：默认 true —— 底层网络抖动时指数退避自动重连。</li>
  *   <li>{@code connectionTimeoutSeconds}：默认 30 秒。</li>
  *   <li>{@code keepAliveIntervalSeconds}：默认 60 秒。</li>
@@ -229,20 +231,26 @@ public class MqttSubscribeUtil implements AutoCloseable {
                 }
             });
 
-            // 组装 MqttConnectionOptions（MQTT 5 版本）
+            // 组装 MqttConnectionOptions（MQTT 5 版本）：
+            // 除 cleanStart/automaticReconnect/心跳/鉴权等基础字段外，
+            // 还通过 setSessionExpiryInterval 启用 MQTT 5 的会话过期机制（v3 没有），
+            // 使断线后重连仍能保留订阅和未处理消息的时间窗口可控。
             MqttConnectionOptions options = new MqttConnectionOptions();
             options.setCleanStart(b.cleanStart);
             options.setAutomaticReconnect(b.automaticReconnect);
             options.setConnectionTimeout(b.connectionTimeoutSeconds);
             options.setKeepAliveInterval(b.keepAliveIntervalSeconds);
+            options.setSessionExpiryInterval(b.sessionExpiryIntervalSeconds);
             if (b.username != null) options.setUserName(b.username);
             if (b.password != null)
                 options.setPassword(new String(b.password).getBytes(StandardCharsets.UTF_8));
 
             log.info("[MqttSubscribeUtil] 开始连接 broker={} clientId={} username={} password={} " +
-                            "cleanStart={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={}",
+                            "cleanStart={} automaticReconnect={} connectionTimeoutSec={} keepAliveIntervalSec={} " +
+                            "sessionExpiryIntervalSec={}",
                     b.broker, clientId, b.username, b.password != null ? "*****" : "null",
-                    b.cleanStart, b.automaticReconnect, b.connectionTimeoutSeconds, b.keepAliveIntervalSeconds);
+                    b.cleanStart, b.automaticReconnect, b.connectionTimeoutSeconds, b.keepAliveIntervalSeconds,
+                    b.sessionExpiryIntervalSeconds);
 
             // 阻塞直到收到 CONNACK 或超时；失败抛 MqttException
             client.connect(options);
@@ -399,6 +407,14 @@ public class MqttSubscribeUtil implements AutoCloseable {
         boolean cleanStart = false;
 
         /**
+         * MQTT 5 会话过期间隔（秒）。默认 3600（1 小时）。
+         *
+         * <p>超过该时长仍未重连，broker 会丢弃本 clientId 的会话与离线消息。
+         * 设为 {@link Long#MAX_VALUE} 表示"无限期保留"，设为 0 表示"立即失效"。
+         */
+        long sessionExpiryIntervalSeconds = 3600L;
+
+        /**
          * 消息处理器。build 前必须设置（非 null）。
          * 直接使用 Paho 的 {@link IMqttMessageListener}，即 `messageArrived(String topic, MqttMessage message)`。
          */
@@ -527,6 +543,20 @@ public class MqttSubscribeUtil implements AutoCloseable {
          */
         public Builder setCleanStart(boolean cleanStart) {
             this.cleanStart = cleanStart;
+            return this;
+        }
+
+        /**
+         * 设置 MQTT 5 会话过期间隔（秒）。默认 3600。
+         *
+         * <p>超过该时长仍未重连，broker 会丢弃本 clientId 的会话与离线消息。
+         * 设为 {@link Long#MAX_VALUE} 表示"无限期保留"，设为 0 表示"立即失效"。
+         *
+         * @param sessionExpiryIntervalSeconds 会话过期间隔（秒）
+         * @return this 链式调用
+         */
+        public Builder setSessionExpiryIntervalSeconds(long sessionExpiryIntervalSeconds) {
+            this.sessionExpiryIntervalSeconds = sessionExpiryIntervalSeconds;
             return this;
         }
 

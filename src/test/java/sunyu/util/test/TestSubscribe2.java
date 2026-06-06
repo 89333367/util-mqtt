@@ -7,6 +7,8 @@ import sunyu.util.MqttPublishUtil;
 import sunyu.util.MqttSubscribeUtil;
 import sunyu.util.mqtt.QosLevel;
 
+import java.nio.charset.StandardCharsets;
+
 /**
  * 失败重试演示：业务处理失败 → 使用独立的 MqttPublishUtil 把消息重新发布回原主题 →
  * broker 按共享订阅规则重新负载均衡到同组的某个订阅者。
@@ -31,11 +33,13 @@ public class TestSubscribe2 {
                 .setClientId("demo-consumer-002")
                 .setMessageHandler((topic, message) -> {
                     try {
+                        // 发布端以 UTF-8 编码字符串为字节数组，消费端必须显式用 UTF-8 还原，
+                        // 避免不同操作系统 / JVM 的默认编码差异造成乱码（尤其 Windows）
+                        String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
                         log.info("[收到消息-2] messageId={}, topic={}, payload={}",
-                                message.getId(), topic, new String(message.getPayload()));
+                                message.getId(), topic, payload);
 
                         // 模拟业务失败（例如数据库连接异常）
-                        String payload = new String(message.getPayload());
                         if ("bad".equals(payload)) {
                             throw new RuntimeException("模拟业务处理失败");
                         }

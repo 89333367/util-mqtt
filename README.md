@@ -62,7 +62,7 @@ import cn.hutool.core.thread.ThreadUtil;
 
 public class DemoPublish {
     public static void main(String[] args) {
-        // 发布端：cleanSession 默认为 true，即用即走
+        // 发布端：cleanStart 默认为 true，即用即走（broker 不保留本端会话）
         MqttPublishUtil producer = MqttPublishUtil.builder()
                 .setBroker("tcp://broker.emqx.io:1883")
                 .setClientId("demo-producer-001")     // 建议显式设置
@@ -113,7 +113,8 @@ try (MqttPublishUtil producer = MqttPublishUtil.builder()
 import sunyu.util.MqttPublishUtil;
 import sunyu.util.MqttSubscribeUtil;
 import sunyu.util.mqtt.QosLevel;
-import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.mqttv5.common.MqttMessage;
+import java.nio.charset.StandardCharsets;
 
 public class DemoSubscribe {
     public static void main(String[] args) throws InterruptedException {
@@ -183,7 +184,7 @@ public class DemoSubscribeWithRepublish {
                 .setClientId("demo-publisher-002")
                 .build();
 
-        // 2) 创建订阅端，cleanSession=false
+        // 2) 创建订阅端，cleanStart=false
         try (MqttSubscribeUtil consumer = MqttSubscribeUtil.builder()
                 .setBroker("tcp://broker.emqx.io:1883")
                 .setClientId("demo-consumer-002")
@@ -279,6 +280,100 @@ consumer.subscribe("topic", QosLevel.AT_LEAST_ONCE);
 // 若需要从整数还原枚举（例如读配置文件得到 int qos 后转换）
 QosLevel level = QosLevel.of(1);  // 返回 AT_LEAST_ONCE
 ```
+
+---
+
+### 例 5-2：MQTT 5 `MqttProperties`（消息级元数据）
+
+**发布端**：通过 `publish(String, QosLevel, byte[], MqttProperties)` 四参重载，把协议级元数据与 payload 分开发送，不污染 payload。
+
+```java
+import sunyu.util.MqttPublishUtil;
+import sunyu.util.mqtt.QosLevel;
+import org.eclipse.paho.mqttv5.common.packet.MqttProperties;
+import org.eclipse.paho.mqttv5.common.packet.UserProperty;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
+public class DemoPublishWithProperties {
+    public static void main(String[] args) {
+        try (MqttPublishUtil producer = MqttPublishUtil.builder()
+                .setBroker("tcp://broker.emqx.io:1883")
+                .setClientId("demo-producer-props-001")
+                .build()) {
+
+            byte[] payload = "{\"hello\":\"mqtt5\"}".getBytes(StandardCharsets.UTF_8);
+
+            MqttProperties props = new MqttProperties();
+            props.setPayloadFormat(true);                               // true = UTF-8 文本
+            props.setContentType("application/json");                   // payload 的 MIME 类型
+            props.setMessageExpiryInterval(600L);                       // 消息在 broker 的 TTL（秒）
+            props.setResponseTopic("demo/response");                    // "请求/响应"模式下响应主题
+            props.setCorrelationData("req-123".getBytes(StandardCharsets.UTF_8)); // 用于匹配请求与响应
+            props.setUserProperties(Arrays.asList(                      // 自定义键值对，可多个
+                    new UserProperty("traceId", "t-" + System.nanoTime()),
+                    new UserProperty("version", "v2-mqtt5")
+            ));
+
+            producer.publish("demo/props", QosLevel.AT_LEAST_ONCE, payload, props);
+        }
+    }
+}
+```
+
+**订阅端**：通过 `message.getProperties()` 读取。
+
+```java
+import sunyu.util.MqttSubscribeUtil;
+import sunyu.util.mqtt.QosLevel;
+import org.eclipse.paho.mqttv5.common.MqttMessage;
+import org.eclipse.paho.mqttv5.common.packet.MqttProperties;
+import org.eclipse.paho.mqttv5.common.packet.UserProperty;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+public class DemoSubscribeWithProperties {
+    public static void main(String[] args) throws InterruptedException {
+        try (MqttSubscribeUtil consumer = MqttSubscribeUtil.builder()
+                .setBroker("tcp://broker.emqx.io:1883")
+                .setClientId("demo-consumer-props-001")
+                .setMessageHandler((topic, message) -> {
+                    String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
+                    System.out.println("[收到] topic=" + topic + " payload=" + payload);
+
+                    MqttProperties props = message.getProperties();
+                    if (props != null) {
+                        System.out.println("  · contentType=" + props.getContentType());
+                        System.out.println("  · responseTopic=" + props.getResponseTopic());
+                        System.out.println("  · messageExpiryInterval=" + props.getMessageExpiryInterval());
+                        List<UserProperty> ups = props.getUserProperties();
+                        if (ups != null) {
+                            for (UserProperty up : ups) {
+                                System.out.println("  · " + up.getKey() + "=" + up.getValue());
+                            }
+                        }
+                    }
+                })
+                .build()) {
+
+            consumer.subscribe("demo/props", QosLevel.AT_LEAST_ONCE);
+            Thread.currentThread().join();
+        }
+    }
+}
+```
+
+常用 `MqttProperties` 字段一览：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `payloadFormat` | boolean | `true` 表示 payload 是 UTF-8 文本（JSON、文本等），`false` 表示二进制 |
+| `contentType` | String | payload 的 MIME 类型（如 `application/json`、`application/octet-stream`） |
+| `messageExpiryInterval` | Long | broker 保留该消息的秒数（TTL），超过后自动丢弃 |
+| `responseTopic` | String | "请求/响应"模式下响应消息应发往的主题 |
+| `correlationData` | byte[] | 用于匹配请求与响应的关联数据 |
+| `userProperties` | List&lt;UserProperty&gt; | 自定义键值对（可多个），典型用于 traceId、tenantId、version 等 |
+| `subscriptionIdentifiers` | List&lt;Integer&gt; | 订阅标识（订阅时设置，消息到达时回传，用于区分是哪个订阅匹配到的） |
 
 ---
 
@@ -383,14 +478,16 @@ public class DemoIoTSubscribeAndCommand {
 
 ```java
 MqttPublishUtil.builder()
-    .setBroker("tcp://host:1883")           // broker 地址，默认 tcp://broker.emqx.io:1883
-    .setClientId("my-client")                // 客户端标识；未设置时自动生成 pub-xxx
-    .setUsername("user")                     // 鉴权用户名（可选）
-    .setPassword("pwd")                      // 鉴权密码（可选，支持 String / char[]）
-    .setCleanStart(true)                     // 发布端默认 true，订阅端默认 false（MQTT 5 Clean Start）
-    .setAutomaticReconnect(true)             // 默认 true，网络抖动自动指数退避重连
-    .setConnectionTimeoutSeconds(30)         // connect 同步超时，默认 30
-    .setKeepAliveIntervalSeconds(60)         // 心跳，默认 60，建议小于 broker 的会话超期时间
+    .setBroker("tcp://host:1883")                           // broker 地址，默认 tcp://broker.emqx.io:1883
+    .setClientId("my-client")                                // 客户端标识；发布端未设置时自动生成 pub-xxx
+    .setUsername("user")                                     // 鉴权用户名（可选）
+    .setPassword("pwd")                                      // 鉴权密码（可选，支持 String / char[]）
+    .setCleanStart(true)                                     // 发布端默认 true，订阅端默认 false（MQTT 5 Clean Start）
+    .setSessionExpiryIntervalSeconds(0L)                     // MQTT 5 独有；broker 断线后保留本 clientId 会话的最长秒数
+                                                              //   发布端默认 0（即用即走）；订阅端默认 3600（1 小时）
+    .setAutomaticReconnect(true)                             // 默认 true，网络抖动自动指数退避重连
+    .setConnectionTimeoutSeconds(30)                         // connect 同步超时，默认 30
+    .setKeepAliveIntervalSeconds(60)                         // 心跳，默认 60，建议小于 broker 的会话超期时间
     .build();
 
 // MqttSubscribeUtil 额外支持
@@ -404,4 +501,16 @@ MqttSubscribeUtil.builder()
     .setMqttErrorHandler(ex -> { ... })                      // 可选，MQTT 协议层错误回调（MqttException）
     .setDeliveryCompleteHandler(token -> { ... })             // 可选，订阅端默认不主动发消息，保留用于扩展
     .build();
+```
+
+### `MqttPublishUtil.publish(...)` 重载一览
+
+```java
+producer.publish("topic", QosLevel.AT_LEAST_ONCE, "hello");                   // 字符串（内部按 UTF-8 编码）
+producer.publish("topic", QosLevel.AT_LEAST_ONCE, bytes);                      // 二进制（protobuf、压缩包等）
+producer.publish("topic", QosLevel.AT_LEAST_ONCE, bytes, mqttProperties);      // 二进制 + MQTT 5 消息属性
+                                                                                //   （payloadFormat / contentType /
+                                                                                //    messageExpiryInterval /
+                                                                                //    responseTopic / correlationData /
+                                                                                //    userProperties 等）
 ```
