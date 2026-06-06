@@ -298,15 +298,21 @@ public class MqttPublishUtil implements AutoCloseable {
     /**
      * 生成 clientId：前缀 + UUID（去连字符），总长度截断到 {@link #MAX_CLIENT_ID_LENGTH}。
      *
-     * <p>发布端前缀固定为 {@code pub}，便于在 broker 日志中区分两类客户端。
+     * <p>注意：Paho v5 的 {@link MqttClient} 并不提供官方的 `generateClientId` 静态方法
+     * （该方法仅存在于 Paho v3 的 `org.eclipse.paho.client.mqttv3.MqttClient` 中）。
+     * 这里采用等价但更可控的实现：使用 Java 标准的 {@link UUID#randomUUID()}，
+     * 并强制长度 ≤ 23 字节以兼容 EMQX / Mosquitto / HiveMQ 等 broker。
      *
-     * @param prefix 标识前缀，null 或空时降级为 {@code mqtt}
+     * @param prefix 标识前缀；null 或空时回退为 {@code pub}，以便在 broker 日志中
+     *               一眼识别为发布端客户端
      * @return 形如 {@code pub-0a1b2c3d4e5f6a7b8c} 的 clientId，长度 ≤ 23
      */
     static String generateClientId(String prefix) {
-        String base = (prefix == null ? "mqtt" : prefix) + "-"
+        String base = (prefix == null || prefix.isEmpty() ? "pub" : prefix) + "-"
                 + UUID.randomUUID().toString().replace("-", "");
-        return base.length() > MAX_CLIENT_ID_LENGTH ? base.substring(0, MAX_CLIENT_ID_LENGTH) : base;
+        return base.length() > MAX_CLIENT_ID_LENGTH
+                ? base.substring(0, MAX_CLIENT_ID_LENGTH)
+                : base;
     }
 
     /**
